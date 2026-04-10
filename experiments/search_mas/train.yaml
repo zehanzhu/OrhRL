@@ -1,0 +1,216 @@
+defaults:
+- ../../orchrl/config/ppo_trainer@models.model_0.ppo_trainer_config: base
+- ../../orchrl/config/ppo_trainer@models.model_1.ppo_trainer_config: base
+- ../../orchrl/config/ppo_trainer@models.model_2.ppo_trainer_config: base
+- _self_
+workflow_type: external_mas
+specialization: role_specific # role_specific | role_sharing
+resource:
+  nnodes: 1
+  n_gpus_per_node: 6
+  trust_remote_code: true
+env:
+  name: search_env
+  dataset: drmas_search
+  benchmark: drmas_search_nosearch
+  multi_modal: false
+  batched_init: true
+agent_policy_configs:
+  agent_configs:
+    agent_0:
+      name: verifier
+      policy_name: verifier_model
+      train_llm_config:
+        enable_thinking: false
+        temperature: 0.2
+        top_p: 0.95
+        top_k: 20
+        min_p: 0.0
+      val_llm_config:
+        enable_thinking: false
+        temperature: 0.0
+        top_p: 1.0
+        top_k: 20
+        min_p: 0.0
+    agent_1:
+      name: searcher
+      policy_name: searcher_model
+      train_llm_config:
+        enable_thinking: false
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        min_p: 0.0
+      val_llm_config:
+        enable_thinking: false
+        temperature: 0.0
+        top_p: 1.0
+        top_k: 20
+        min_p: 0.0
+    agent_2:
+      name: answerer
+      policy_name: answerer_model
+      train_llm_config:
+        enable_thinking: false
+        temperature: 0.4
+        top_p: 0.95
+        top_k: 20
+        min_p: 0.0
+      val_llm_config:
+        enable_thinking: false
+        temperature: 0.0
+        top_p: 1.0
+        top_k: 20
+        min_p: 0.0
+base_models:
+  policy_0:
+    path: ~/data/models/Qwen/Qwen3-4B-Instruct-2507
+    name: verifier_model
+  policy_1:
+    path: ~/data/models/Qwen/Qwen3-4B-Instruct-2507
+    name: searcher_model
+  policy_2:
+    path: ~/data/models/Qwen/Qwen3-4B-Instruct-2507
+    name: answerer_model
+training:
+  rollout_source: mate
+  device: cuda
+  total_training_steps: 2
+  project_name: orchrl
+  experiment_name: search_mas_app
+  output_root_dir: outputs/training_runs
+  data_root_dir: ~/data/mas_app/search/data/drmas_search_mas
+  train_data_path: ${training.data_root_dir}/train.parquet
+  val_data_path: ${training.data_root_dir}/test.parquet
+  run_name: ${training.experiment_name}
+  run_id: ${now:%Y%m%d_%H%M%S}
+  run_dir: ${training.output_root_dir}/${training.run_name}/${training.run_id}
+  logger:
+  - console
+  model_checkpoints_dir: ${training.run_dir}/checkpoints
+  ray_wait_register_center_timeout: 300
+  train_batch_size: 2
+  validate_batch_size: 10
+  train_sample_num: 1
+  sample_temperature: 0.6
+  val_freq: 500
+  max_prompt_length: 2048
+  max_response_length: 2048
+  mate:
+    roles: [verifier, searcher, answerer]
+    role_policy_mapping:
+      verifier: verifier_model
+      searcher: searcher_model
+      answerer: answerer_model
+    batch_size: ${training.train_batch_size}
+    # n_samples_per_prompt: ${training.train_sample_num}
+    n_samples_per_prompt: 1
+    rollout_mode: tree # tree | parallel
+    tree:
+      k_branches: 4
+      max_concurrent_branches: 2
+    max_concurrent_episodes: 2
+    monitor_pool:
+      size: 8
+      host: 127.0.0.1
+      base_port: 19000
+      acquire_timeout_sec: 300
+    timeout: 120
+    backend_timeout: 120
+    credit_assignment: all_turns
+    mas_work_dir: mas_apps/search
+    mas_command_template: python scripts/run_search_mas.py --config {config_path} --question {prompt}
+    config_template_path: mas_apps/search/configs/inference.yaml
+    prompt_loader:
+      source_type: parquet
+      path: ${training.train_data_path}
+      prompt_keys: [question, prompt, query, problem, input]
+      expected_keys: [expected_answer, answer, expected_answers, gold_answer, golden_answers, target, label]
+    reward:
+      provider: task_plugins.search_mas.reward:compute_reward
+    trajectory_export:
+      enable: true
+      output_dir: ${training.run_dir}/trajectories
+      write_json: true
+      write_txt: true
+      include_token_details: true
+      answer_stats_provider: task_plugins.search_mas.reward:build_answer_stats
+models:
+  model_0:
+    path: ${base_models.policy_0.path}
+    name: ${base_models.policy_0.name}
+    ppo_trainer_config:
+      filter_method: uid
+      filter_ratio: 0.0
+      data:
+        train_files: ${training.train_data_path}
+        val_files: ${training.val_data_path}
+        max_prompt_length: ${training.max_prompt_length}
+        max_response_length: ${training.max_response_length}
+      actor_rollout_ref:
+        model:
+          path: ${base_models.policy_0.path}
+          override_config:
+            model_id: ${base_models.policy_0.name}
+        rollout:
+          temperature: ${training.sample_temperature}
+          prompt_length: ${training.max_prompt_length}
+          response_length: ${training.max_response_length}
+          tensor_model_parallel_size: 2
+          prometheus:
+            served_model_name: verifier_model
+        trainer:
+          n_gpus_per_node: 2
+          n_training_gpus_per_node: 2
+  model_1:
+    path: ${base_models.policy_1.path}
+    name: ${base_models.policy_1.name}
+    ppo_trainer_config:
+      filter_method: uid
+      filter_ratio: 0.0
+      data:
+        train_files: ${training.train_data_path}
+        val_files: ${training.val_data_path}
+        max_prompt_length: ${training.max_prompt_length}
+        max_response_length: ${training.max_response_length}
+      actor_rollout_ref:
+        model:
+          path: ${base_models.policy_1.path}
+          override_config:
+            model_id: ${base_models.policy_1.name}          
+        rollout:
+          temperature: ${training.sample_temperature}
+          prompt_length: ${training.max_prompt_length}
+          response_length: ${training.max_response_length}
+          tensor_model_parallel_size: 2
+          prometheus:
+            served_model_name: searcher_model
+        trainer:
+          n_gpus_per_node: 2
+          n_training_gpus_per_node: 2
+  model_2:
+    path: ${base_models.policy_2.path}
+    name: ${base_models.policy_2.name}
+    ppo_trainer_config:
+      filter_method: uid
+      filter_ratio: 0.0
+      data:
+        train_files: ${training.train_data_path}
+        val_files: ${training.val_data_path}
+        max_prompt_length: ${training.max_prompt_length}
+        max_response_length: ${training.max_response_length}
+      actor_rollout_ref:
+        model:
+          path: ${base_models.policy_2.path}
+          override_config:
+            model_id: ${base_models.policy_2.name}
+        rollout:
+          temperature: ${training.sample_temperature}
+          prompt_length: ${training.max_prompt_length}
+          response_length: ${training.max_response_length}
+          tensor_model_parallel_size: 2
+          prometheus:
+            served_model_name: answerer_model
+        trainer:
+          n_gpus_per_node: 2
+          n_training_gpus_per_node: 2

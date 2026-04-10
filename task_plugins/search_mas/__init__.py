@@ -1,0 +1,1 @@
+"""Search MAS task plugins."""
