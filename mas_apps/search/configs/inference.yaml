@@ -11,11 +11,10 @@ llm:
   model: Qwen3-4B-Instruct-2507
   temperature: 0.6
   top_p: 0.95
-  max_tokens: 1536
+  max_tokens: 1024
 search:
-  provider: http
-  retrieval_service_url: http://127.0.0.1:18080/retrieve
-  # retrieval_service_url: http://8.92.9.155:18010/retrieve
+  provider: http # http | disabled
+  retrieval_service_url: http://127.0.0.1:8010/retrieve
   topk: 2
   return_scores: true
   timeout: 30
@@ -26,17 +25,17 @@ agents:
     llm: null
     temperature: 0.2
     top_p: 0.95
-    max_tokens: 4096
+    max_tokens: 1024
   searcher:
     llm: null
     temperature: 0.6
     top_p: 0.95
-    max_tokens: 4096
+    max_tokens: 1024
   answerer:
     llm: null
     temperature: 0.4
     top_p: 0.95
-    max_tokens: 4096
+    max_tokens: 1024
 data:
   input_path: ~/data/drmas_search_mas/test_sampled.parquet
 output:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -149,7 +150,8 @@ class MateRolloutAdapter:
     def _load_config_template(self) -> dict[str, Any]:
         inline_template = self._config.get("config_template")
         if isinstance(inline_template, dict):
-            return dict(inline_template)
+            loaded = copy.deepcopy(inline_template)
+            return self._apply_generation_limits(loaded)
 
         template_path = self._config.get("config_template_path")
         if not isinstance(template_path, str) or not template_path:
@@ -159,7 +161,34 @@ class MateRolloutAdapter:
             loaded = yaml.safe_load(file_obj)
         if not isinstance(loaded, dict):
             raise ValueError("mate config template must load as a dict")
-        return loaded
+        return self._apply_generation_limits(copy.deepcopy(loaded))
+
+    def _apply_generation_limits(self, config_template: dict[str, Any]) -> dict[str, Any]:
+        max_response_length = self._config.get("max_response_length")
+        if max_response_length is None:
+            return config_template
+
+        resolved_limit = int(max_response_length)
+        llm_cfg = config_template.setdefault("llm", {})
+        if isinstance(llm_cfg, dict):
+            llm_cfg["max_tokens"] = resolved_limit
+
+        agents_cfg = config_template.setdefault("agents", {})
+        if not isinstance(agents_cfg, dict):
+            agents_cfg = {}
+            config_template["agents"] = agents_cfg
+
+        for role in self._roles:
+            role_cfg = agents_cfg.setdefault(role, {})
+            if not isinstance(role_cfg, dict):
+                role_cfg = {}
+                agents_cfg[role] = role_cfg
+            role_cfg["max_tokens"] = resolved_limit
+            role_llm_cfg = role_cfg.get("llm")
+            if isinstance(role_llm_cfg, dict):
+                role_llm_cfg["max_tokens"] = resolved_limit
+
+        return config_template
 
     @staticmethod
     def _annotate_tree_result(result: TreeEpisodeResult, metadata: dict[str, Any]) -> None:

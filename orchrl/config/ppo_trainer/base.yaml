@@ -35,17 +35,26 @@ data:
 actor_rollout_ref:
   hybrid_engine: True
   model:
+    _target_: verl.workers.config.HFModelConfig
     path: Qwen/Qwen3-8B
     #path: "/home/yujie/models/Qwen3-4B" # Set to null to allow overriding
+    hf_config_path: null
+    tokenizer_path: null
     use_shm: False
+    trust_remote_code: False
+    custom_chat_template: null
     external_lib: orchrl
     override_config: { }
     enable_gradient_checkpointing: True
     enable_activation_offload: True
     use_remove_padding: True
+    lora_rank: 0
+    lora_alpha: 16
+    target_modules: all-linear
+    exclude_modules: null
+    lora_adapter_path: null
     use_liger: False
     use_fused_kernels: False
-    trust_remote_code: False
   actor:
     _target_: verl.workers.config.FSDPActorConfig
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
@@ -125,6 +134,8 @@ actor_rollout_ref:
     name: vllm
     _target_: verl.workers.config.RolloutConfig    
     mode: async # sync: LLM, async: AsyncLLM
+    nnodes: 1
+    n_gpus_per_node: 2
     temperature: 0.6
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1
@@ -140,8 +151,11 @@ actor_rollout_ref:
     layered_summon: False # for huge model, layered summon can save memory (prevent OOM) but make it slower
     tensor_model_parallel_size: 4
     data_parallel_size: 1
+    expert_parallel_size: 1
     pipeline_model_parallel_size: 1
     max_num_batched_tokens: 4096 #
+    logprobs_mode: processed_logprobs
+    scheduling_policy: fcfs
     max_model_len: 8192
     max_num_seqs: 32
     log_prob_micro_batch_size: 4 # will be deprecated, use log_prob_micro_batch_size_per_gpu
@@ -149,6 +163,8 @@ actor_rollout_ref:
     log_prob_use_dynamic_bsz: False
     log_prob_max_token_len_per_gpu: 2048 # for log_prob computation, usually shorter than rollout max token len, can further reduce memory usage
     disable_log_stats: True
+    multi_stage_wake_up: False
+    calculate_log_probs: False
     enable_chunked_prefill: True # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
     # for hf rollout
     do_sample: True
@@ -160,20 +176,24 @@ actor_rollout_ref:
       sglang:
         attention_backend: null # null means use the engine default value, available options: flashinfer, triton, flashmla
     val_kwargs:
+      _target_: verl.workers.config.SamplingConfig
       # sampling parameters for validation
       top_k: -1 # 0 for hf rollout, -1 for vllm rollout
       top_p: 1.0
       temperature: 0
       n: 1
       do_sample: False # default eager for validation
-    multi_turn: 
+    multi_turn:
+      _target_: verl.workers.config.MultiTurnConfig
       enable: False  # should set rollout.name to sglang_async if True
-      max_turns: 4 # null for no limit (default max_length // 3)
+      max_assistant_turns: 4 # null for no limit (default max_length // 3)
+      max_user_turns: 4
       tool_config_path: null  # null for no tool
       format: chatml  # chatml, more formats will be supported in the future
     
     # [Experimental] agent loop based rollout configs
     agent:
+      _target_: verl.workers.config.AgentLoopConfig
       # Number of agent loop workers
       num_workers: 4
       
@@ -191,10 +211,18 @@ actor_rollout_ref:
       
       # custom async server configs
       custom_async_server:
+        _target_: verl.workers.config.CustomAsyncServerConfig
         # Path to the custom async server implementation
         path: null
         # Class name of the custom async server class (e.g. AsyncvLLMServer)
         name: null
+    trace:
+      _target_: verl.workers.config.TraceConfig
+      project_name: ${oc.select:trainer.project_name,null}
+      experiment_name: ${oc.select:trainer.experiment_name,null}
+      backend: null
+      token2text: false
+      max_samples_per_step_per_worker: null
 
     # prometheus configuration for vllm/sglang server mode
     prometheus:
@@ -217,6 +245,9 @@ actor_rollout_ref:
       update_weights_bucket_megabytes: 2048
       # Additional keyword arguments to pass to the checkpoint engine constructor
       engine_kwargs: {}
+    skip_rollout: false
+    skip_dump_dir: /tmp/rollout_dump
+    enable_sleep_mode: true
 
 critic:
   _target_: verl.workers.config.FSDPCriticConfig
@@ -362,6 +393,53 @@ reward_model:
 custom_reward_function:
   path: null
   name: compute_score
+
+reward:
+  num_workers: 8
+  custom_reward_function:
+    path: null
+    name: compute_score
+  reward_manager:
+    _target_: verl.workers.config.reward_model.RewardManagerConfig
+    source: register
+    name: naive
+    module:
+      _target_: verl.trainer.config.config.ModuleConfig
+      path: null
+      name: custom_reward_manager
+  reward_model:
+    enable: false
+    enable_resource_pool: false
+    n_gpus_per_node: 0
+    nnodes: 0
+    model_path: null
+    rollout:
+      _target_: verl.workers.config.RolloutConfig
+      name: vllm
+      dtype: bfloat16
+      gpu_memory_utilization: 0.5
+      enforce_eager: true
+      cudagraph_capture_sizes: null
+      free_cache_engine: true
+      data_parallel_size: 1
+      expert_parallel_size: 1
+      tensor_model_parallel_size: 2
+      max_num_batched_tokens: 8192
+      max_model_len: null
+      max_num_seqs: 1024
+      load_format: auto
+      engine_kwargs: {}
+      limit_images: null
+      enable_chunked_prefill: true
+      enable_prefix_caching: true
+      disable_log_stats: true
+      skip_tokenizer_init: false
+      prompt_length: 2048
+      response_length: 2048
+  sandbox_fusion:
+    url: null
+    max_concurrent: 64
+    memory_limit_mb: null
 
 algorithm:
   adv_estimator: grpo

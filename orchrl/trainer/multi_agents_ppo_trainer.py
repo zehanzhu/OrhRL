@@ -186,6 +186,7 @@ class MultiAgentsPPOTrainer:
         )
         self.mate_runtime.initialize(
             tokenizer_dict=self.tokenizer_dict,
+            async_rollout_manager_dict=self.policy_trainer_registry.get_async_rollout_managers(),
             server_handle_dict=server_handle_dict,
             policy_server_name_mapping=policy_server_name_mapping,
         )

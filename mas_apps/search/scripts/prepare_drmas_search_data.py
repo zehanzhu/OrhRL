@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +68,24 @@ def _save_jsonl(df: pd.DataFrame, output_path: Path) -> None:
     with output_path.open("w", encoding="utf-8") as f:
         for record in df.to_dict(orient="records"):
             f.write(json.dumps(record, ensure_ascii=False, default=_json_default) + "\n")
+
+
+def _save_parquet(df: pd.DataFrame, output_path: Path) -> None:
+    try:
+        df.to_parquet(output_path, index=False)
+    except OSError as exc:
+        # Some mounted filesystems reject pyarrow's direct output stream writes.
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            df.to_parquet(tmp_path, index=False)
+            shutil.copyfile(tmp_path, output_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        else:
+            tmp_path.unlink(missing_ok=True)
+            print(f"Fell back to temp parquet write for {output_path}: {exc}")
 
 
 def _resolve_dataset_root(dataset_root_arg: str | None) -> Path | None:
@@ -229,9 +249,9 @@ def main() -> None:
     test_path = output_dir / "test.parquet"
     sampled_path = output_dir / "test_sampled.parquet"
 
-    train_processed.to_parquet(train_path, index=False)
-    test_processed.to_parquet(test_path, index=False)
-    test_sampled.to_parquet(sampled_path, index=False)
+    _save_parquet(train_processed, train_path)
+    _save_parquet(test_processed, test_path)
+    _save_parquet(test_sampled, sampled_path)
 
     print(f"train size: {len(train_processed)} -> {train_path}")
     print(f"test size: {len(test_processed)} -> {test_path}")

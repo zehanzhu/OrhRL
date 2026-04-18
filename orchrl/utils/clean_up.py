@@ -10,6 +10,7 @@ import ray
 
 _CLEANED = False
 _TEMP_DIRS = []
+_RAY_PROCESS_MATCHERS = []
 
 
 def register_temp_dirs(*dirs):
@@ -17,17 +18,16 @@ def register_temp_dirs(*dirs):
     _TEMP_DIRS.extend(dirs)
 
 
+def register_ray_process_matchers(*matchers):
+    """Register process command-line matchers owned by the current training session."""
+    for matcher in matchers:
+        if matcher and matcher not in _RAY_PROCESS_MATCHERS:
+            _RAY_PROCESS_MATCHERS.append(matcher)
+
+
 def kill_ray_processes():
-    """Kill all Ray-related processes"""
-    patterns = [
-        "ray::",
-        "raylet",
-        "gcs_server",
-        "plasma_store",
-        "default_worker.py",
-        "worker.py",
-    ]
-    for pattern in patterns:
+    """Kill Ray-related processes owned by the current training session only."""
+    for pattern in _RAY_PROCESS_MATCHERS:
         try:
             subprocess.run(
                 ["pkill", "-9", "-f", pattern],
@@ -86,10 +86,10 @@ def run_async_cleanup(coro, *, label: str = "async resource") -> bool:
 
 def install_cleanup_hooks():
     """Install cleanup hooks for normal exit and signals"""
-    atexit.register(cleanup_ray)
+    atexit.register(cleanup_ray_runtime)
 
     def signal_handler(signum, frame):
-        cleanup_ray()
+        cleanup_ray_runtime()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)

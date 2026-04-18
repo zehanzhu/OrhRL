@@ -320,7 +320,12 @@ def _normalize_prompt_ids(prompt_ids, max_prompt_length: int) -> list[int] | Non
         prompt_ids = prompt_ids.tolist()
     if not isinstance(prompt_ids, list):
         raise TypeError("TurnData.prompt_ids must be a list of token ids when provided")
-    normalized = [int(token_id) for token_id in prompt_ids][-max_prompt_length:]
+    normalized = [int(token_id) for token_id in prompt_ids]
+    if len(normalized) > max_prompt_length:
+        raise ValueError(
+            "TurnData.prompt_ids is longer than configured max_prompt_length; "
+            "runtime prompt truncation and trainer prompt limits are inconsistent"
+        )
     if not normalized:
         raise ValueError("TurnData.prompt_ids must contain at least one token when provided")
     return normalized
@@ -329,7 +334,12 @@ def _normalize_prompt_ids(prompt_ids, max_prompt_length: int) -> list[int] | Non
 def _normalize_response_ids(token_ids, max_response_length: int) -> list[int]:
     if token_ids is None:
         raise ValueError("TurnData.token_ids must not be None for MATE training")
-    response_ids = [int(token_id) for token_id in token_ids][:max_response_length]
+    response_ids = [int(token_id) for token_id in token_ids]
+    if len(response_ids) > max_response_length:
+        raise ValueError(
+            "TurnData.token_ids is longer than configured max_response_length; "
+            "runtime response truncation and trainer response limits are inconsistent"
+        )
     if not response_ids:
         raise ValueError("TurnData.token_ids must contain at least one token")
     return response_ids
