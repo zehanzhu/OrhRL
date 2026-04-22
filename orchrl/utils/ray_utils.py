@@ -49,9 +49,23 @@ def init_ray_with_temp_dirs(config=None, n_gpus_per_node=None):
         n_gpus_per_node = min(n_gpus_per_node, available_gpu_count)
     
     print(f"Initializing Ray with {n_gpus_per_node} GPUs")
+    runtime_env_vars = {
+        "TOKENIZERS_PARALLELISM": "true",
+        "NCCL_DEBUG": "WARN",
+        "VLLM_LOGGING_LEVEL": "WARN",
+        "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "VLLM_DISABLE_COMPILE_CACHE": "1",
+        "VLLM_ASCEND_ENABLE_NZ": "0",
+        # Needed for multiple colocated NPU processes that each initialize HCCL.
+        "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
+        "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
+    }
+    runtime_env_vars = {key: value for key, value in runtime_env_vars.items() if os.environ.get(key) is None}
+
     ray_context = ray.init(
         num_gpus=n_gpus_per_node,
-        runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}},
+        runtime_env={"env_vars": runtime_env_vars},
         _temp_dir=ray_tmp_dir,
         _system_config=system_config
     )
