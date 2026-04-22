@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from .datatypes import EpisodeResult
+from .datatypes import EpisodeResult, ParallelRolloutResult, RolloutFailure
 from .monitor_pool import MonitorPoolManager
 from .pipe import AgentPipe, AgentPipeConfig
 from .reward import RewardProvider
@@ -19,7 +19,7 @@ async def parallel_rollout(
     max_concurrent: int | None = None,
     *,
     monitor_pool_manager: MonitorPoolManager,
-) -> list[EpisodeResult]:
+) -> ParallelRolloutResult:
     """
     Sample n_samples_per_prompt episodes in parallel for each prompt.
     max_concurrent limits the number of AgentPipes running simultaneously (None = unlimited).
@@ -29,7 +29,12 @@ async def parallel_rollout(
     if max_concurrent is not None and max_concurrent < 1:
         raise ValueError("max_concurrent must be >= 1 when provided")
     if not prompts:
-        return []
+        return ParallelRolloutResult(
+            episodes=[],
+            expected_job_count=0,
+            success_count=0,
+            failed_count=0,
+        )
 
     semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent is not None else None
 
@@ -58,13 +63,43 @@ async def parallel_rollout(
         for _ in range(n_samples_per_prompt)
     ]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
+    return _summarize_parallel_results(
+        prompts=prompts,
+        gathered=gathered,
+        n_samples_per_prompt=n_samples_per_prompt,
+    )
 
+
+def _summarize_parallel_results(
+    *,
+    prompts,
+    gathered,
+    n_samples_per_prompt,
+) -> ParallelRolloutResult:
+    expected_job_count = len(prompts) * n_samples_per_prompt
     results: list[EpisodeResult] = []
-    for item in gathered:
+    failures: list[RolloutFailure] = []
+    for index, item in enumerate(gathered):
+        prompt_idx = index // n_samples_per_prompt if n_samples_per_prompt else 0
+        sample_idx = index % n_samples_per_prompt if n_samples_per_prompt else None
         if isinstance(item, Exception):
             _LOGGER.warning("parallel_rollout dropped failed episode: %s", item)
+            failures.append(
+                RolloutFailure(
+                    error_type=type(item).__name__,
+                    message=str(item),
+                    prompt=str(prompts[prompt_idx]) if prompt_idx < len(prompts) else None,
+                    sample_idx=sample_idx,
+                )
+            )
             continue
         if isinstance(item, BaseException):
             raise item
         results.append(item)
-    return results
+    return ParallelRolloutResult(
+        episodes=results,
+        expected_job_count=expected_job_count,
+        success_count=len(results),
+        failed_count=len(failures),
+        failures=failures,
+    )

@@ -37,6 +37,7 @@ async def tree_rollout(
     pilot_total_turns = len(pilot_buffer)
 
     if pilot_result.status != "success" or not pilot_buffer:
+        expected_branch_count = 0
         return TreeEpisodeResult(
             pilot_result=pilot_result,
             branch_results=[],
@@ -44,6 +45,8 @@ async def tree_rollout(
             tree_metadata={
                 "n_branch_points": 0,
                 "k_branches": k_branches,
+                "expected_branch_count": expected_branch_count,
+                "failed_branch_count": 0,
                 "total_branches_collected": 0,
                 "pilot_total_turns": pilot_total_turns,
             },
@@ -105,6 +108,7 @@ async def tree_rollout(
         for global_position, record in enumerate(pilot_buffer)
         for _ in range(k_branches)
     ]
+    expected_branch_count = len(tasks)
     branch_results = [result for result in await asyncio.gather(*tasks) if result is not None]
 
     return TreeEpisodeResult(
@@ -114,6 +118,8 @@ async def tree_rollout(
         tree_metadata={
             "n_branch_points": pilot_total_turns,
             "k_branches": k_branches,
+            "expected_branch_count": expected_branch_count,
+            "failed_branch_count": expected_branch_count - len(branch_results),
             "total_branches_collected": len(branch_results),
             "pilot_total_turns": pilot_total_turns,
         },

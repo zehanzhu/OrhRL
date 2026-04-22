@@ -36,7 +36,7 @@ with initialize_config_dir(version_base=None, config_dir=config_dir):
 values = {
     'MAS_WORK_DIR': cfg.training.mate.mas_work_dir,
     'CONFIG_TEMPLATE_PATH': cfg.training.mate.config_template_path,
-    'TRAIN_PROMPT_DATA_PATH': cfg.training.mate.prompt_loader.path,
+    'TRAIN_PROMPT_DATA_PATH': cfg.training.train_data_path,
     'VAL_PROMPT_DATA_PATH': cfg.training.val_data_path,
     'MODEL_PATH_0': cfg.base_models.policy_0.path,
     'MODEL_PATH_1': cfg.base_models.policy_1.path,
@@ -64,7 +64,7 @@ for required_file in "$CONFIG_TEMPLATE_PATH" "$TRAIN_PROMPT_DATA_PATH" "$VAL_PRO
   fi
 done
 
-export WANDB_MODE=offline
+export WANDB_MODE="${WANDB_MODE:-online}"
 export HYDRA_FULL_ERROR=1
 export NCCL_IB_DISABLE=1
 export NCCL_NET_GDR_LEVEL=0

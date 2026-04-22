@@ -6,6 +6,7 @@
 
 - 训练启动脚本：`experiments/search_mas/run_train_e2e.sh`
 - 主训练配置：`experiments/search_mas/train.yaml`
+- Search MAS 模板配置：`mas_apps/search/configs/inference.yaml`
 - Python 入口：`orchrl/trainer/train.py`
 - 总训练器：`orchrl/trainer/multi_agents_ppo_trainer.py`
 - 外部 MAS 应用：`mas_apps/search`
@@ -186,7 +187,7 @@ flowchart TD
     J --> K["episode_batch"]
     K --> L["accumulate_validation_episode_batch(stats, episodes)"]
     L --> M["build_validation_metrics(stats)"]
-    M --> N["validation/sample_avg_reward"]
+    M --> N["validation/sample_avg_reward + validation/failed_sample_rate"]
     N --> O{"global_steps > 0"}
     O -->|yes| P["save_best_checkpoint(sample_avg_reward)"]
     P --> Q{"sample_avg_reward > best_validation_reward"}
@@ -205,10 +206,10 @@ flowchart TD
 - `workflow_type: external_mas`
 - `specialization: role_specific`
 - agent roles：`verifier`、`searcher`、`answerer`
-- `training.total_training_steps: 2`
+- `training.total_training_steps: 100`
 - `training.train_batch_size: 2`
 - `training.validate_batch_size: 10`
-- `training.val_freq: 500`
+- `training.val_freq: 5`
 
 当前仓库只保留两种 specialization：
 
@@ -246,7 +247,11 @@ flowchart TD
 
 - `training.data_root_dir: /data1/zzh/mas_app/search/data/drmas_search_mas`
 - `training.train_data_path: ${training.data_root_dir}/train.parquet`
-- `training.val_data_path: ${training.data_root_dir}/test.parquet`
+- `training.val_data_path: ${training.data_root_dir}/test_sampled.parquet`
+
+当前 `train.yaml` 中也保留了完整验证集路径示例：
+
+- `# val_data_path: ${training.data_root_dir}/test.parquet`
 
 当前输出目录布局：
 
@@ -254,6 +259,13 @@ flowchart TD
 - `training.run_dir: outputs/training_runs/<run_name>/<run_id>`
 - `training.model_checkpoints_dir: outputs/training_runs/<run_name>/<run_id>/checkpoints`
 - `training.mate.trajectory_export.output_dir: outputs/training_runs/<run_name>/<run_id>/trajectories`
+- `training.mate.mas_log_dir: outputs/training_runs/<run_name>/<run_id>/mas_logs`
+
+对应的仓库级输出位置可以直接理解为：
+
+- `outputs/training_runs/<experiment_name>/<run_id>/checkpoints`
+- `outputs/training_runs/<experiment_name>/<run_id>/trajectories`
+- `outputs/logs/`
 
 `train.py` 在真正启动训练前，会通过 `prepare_training_output_dirs()` 自动创建这些目录。
 
@@ -268,6 +280,8 @@ flowchart TD
 3. 检查 MAS 工作目录、配置模板、数据集、模型路径是否存在。
 4. 设置运行环境变量。
 5. 执行 `python3 -m orchrl.trainer.train --config-path ... --config-name train`。
+
+这里读取训练/验证数据路径时，使用的是 `cfg.training.train_data_path` 和 `cfg.training.val_data_path`，不是 `cfg.training.mate.prompt_loader.path`。
 
 因此它本质上是 fail-fast 启动脚本。
 
@@ -356,8 +370,18 @@ flowchart TD
 - `source_type`
 - `prompt_keys`
 - `expected_keys`
+- `train_repeat`
+- `train_shuffle`
+- `train_seed`
 
 而不是最终的数据文件路径来源。
+
+另外，`MateRuntime` 会把训练集 loader 配成可重复、可打乱的 train-only 采样器；验证集 loader 则固定为不 repeat、不 shuffle 的全量遍历。
+
+这里还有两组直接影响训练语义的显式配置：
+
+- `match_mode`
+- `failure_policy`
 
 ### 4.3 `TrainingStepExecutor`
 
@@ -405,6 +429,10 @@ flowchart TD
 python scripts/run_search_mas.py --config {config_path} --question {prompt}
 ```
 
+当前默认模板配置文件是：
+
+- `mas_apps/search/configs/inference.yaml`
+
 这意味着 OrchRL 与 MAS 的耦合面主要只有三类：
 
 - 运行目录
@@ -412,6 +440,8 @@ python scripts/run_search_mas.py --config {config_path} --question {prompt}
 - 配置模板
 
 这就是“相对非侵入训练黑盒 MAS”的核心工程基础。
+
+当前 MAS 子进程的 stdout/stderr 不再直接丢弃，而是会按 episode 持久化到 `training.mate.mas_log_dir`，失败轨迹也能回溯到对应日志文件。
 
 ### 5.2 `MateRolloutAdapter` 如何发起 rollout
 
@@ -428,9 +458,9 @@ python scripts/run_search_mas.py --config {config_path} --question {prompt}
 - `tree_rollout`
 - `parallel_rollout`
 
-训练路径默认是：
+训练路径当前默认是：
 
-- `training.mate.rollout_mode: tree`
+- `training.mate.rollout_mode: parallel`
 
 验证路径则被强制改成：
 
@@ -575,23 +605,24 @@ MultiAgentsPPOTrainer.fit()
 
 ### 6.1 prompt 是怎么取的
 
-`MatePromptLoader.get_step_batch(step_idx, batch_size)` 直接做顺序切片：
+`MatePromptLoader.get_step_batch(step_idx, batch_size)` 当前维护内部 cursor，并按照训练配置决定是否 repeat/shuffle：
 
-- `start = step_idx * batch_size`
-- 取 `[start : start + batch_size]`
+- 训练集读取 `training.train_data_path`
+- 使用 `training.mate.prompt_loader.train_repeat`
+- 使用 `training.mate.prompt_loader.train_shuffle`
+- 使用 `training.mate.prompt_loader.train_seed`
 
-当前没有 shuffle，也没有循环采样。
+因此训练不再是简单的 `step_idx * batch_size` 顺序切片，也不会因为数据集刚好被单轮消费完就立刻报空 batch。
 
-因此以当前默认配置：
+验证集则单独走 `iter_batches(batch_size=training.validate_batch_size)`，按固定顺序遍历完整数据集。
 
-- `total_training_steps = 2`
-- `train_batch_size = 2`
+训练侧也会记录 rollout failure 统计指标，例如：
 
-训练主循环最多只会消费训练集前 4 条 prompt。
+- `training/rollout_failed_job_rate`
 
 ### 6.2 tree 模式下哪些 turn 会进入训练
 
-训练默认使用 `tree` rollout，但送入 PPO 的不是所有 branch 的所有 turn。
+当前默认配置使用 `parallel` rollout；如果切换到 `tree` rollout，送入 PPO 的不是所有 branch 的所有 turn。
 
 `tree_episodes_to_decision_point_batches()` 的当前语义是：
 
@@ -681,10 +712,10 @@ validation 这块是旧文档最容易写错的地方，当前真实行为如下
 
 当前默认配置：
 
-- `total_training_steps: 2`
-- `val_freq: 500`
+- `total_training_steps: 100`
+- `val_freq: 5`
 
-因此默认 Search MAS 配置下，训练过程实际上不会触发 validation。
+因此默认 Search MAS 配置下，训练过程中会周期性触发 validation。
 
 ### 7.2 一次 validation 会不会遍历完整验证集
 
@@ -709,15 +740,34 @@ validation 这块是旧文档最容易写错的地方，当前真实行为如下
 
 ### 7.4 验证指标是什么
 
-当前只统计样本级平均 reward：
+当前统计以下样本级指标：
 
 - `validation/sample_avg_reward`
+- `validation/accuracy`
+- `validation/failed_sample_count`
+- `validation/failed_sample_rate`
+
+同时统计 MAS 系统级 outcome / behavior 指标：
+
+- `mas/validation/sample_avg_reward`
+- `mas/validation/accuracy`
+- `mas/validation/success_rate`
+- `mas/validation/failed_rate`
+- `mas/validation/avg_turns`
+- `mas/validation/avg_search_calls`
+- `mas/validation/search_call_rate`
+- `mas/validation/answer_rate`
+- `mas/validation/verifier_yes_rate`
+- `mas/validation/verifier_no_rate`
 
 实现方式是：
 
-1. 每处理完一个验证 batch，就把其中每个 episode 的 `final_reward` 累加到 `reward_sum`。
-2. 同时累加 `sample_count`。
-3. 最终返回 `reward_sum / sample_count`。
+1. 每处理完一个验证 batch，就把成功 episode 的 `final_reward` 累加到 `reward_sum`。
+2. 同时累加预期样本数 `expected_sample_count`，而不是只按成功返回的 episode 数量计数。
+3. 额外累加 rollout 层上报的 `failed_count`。
+4. 最终返回 `reward_sum / expected_sample_count`。
+
+这意味着失败样本会作为 `0.0` reward 计入分母，validation 不会再因为难样本失败后“从分母中消失”而被静默抬高。
 
 当前不会保留完整验证轨迹到内存中再统一计算，只是流式累积统计量。
 
@@ -847,10 +897,10 @@ tree 模式下会同时写出 pilot 与 branches 的详细信息。
   - 当前 validation 强制走 `parallel`，且每个 prompt 只采 1 条轨迹
 - “一次 validation 只抽一小部分验证集”
   - 当前 validation 会遍历整个验证集，但按 `validate_batch_size` 分批执行
-- “默认训练配置会跑到 validation”
-  - 当前默认 `total_training_steps=2`、`val_freq=500`，因此默认不会触发 validation
+- “默认训练配置会跑不到 validation”
+  - 当前默认 `total_training_steps=100`、`val_freq=5`，因此默认训练过程中会触发 validation
 - “stdout 里的 MAS 输出是训练主依据”
-  - 当前训练依赖的是 `MonitorActor` 缓冲区中的 turn 记录
+  - 当前训练依赖的是 `MonitorActor` 缓冲区中的 turn 记录；stdout/stderr 主要用于失败排障并持久化在 `mas_log_dir`
 
 ## 11. 推荐的阅读顺序
 

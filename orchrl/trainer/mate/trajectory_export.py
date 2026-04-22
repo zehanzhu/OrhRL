@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -328,11 +329,17 @@ def maybe_export_prompt_trajectories(*, episodes: list[Any], step_idx: int, roll
     if not output_dir:
         raise ValueError("trajectory export requires trajectory_export.output_dir")
     answer_stats_provider = export_cfg.get("answer_stats_provider")
+    answer_stats_kwargs = dict(export_cfg.get("answer_stats_kwargs") or {})
     answer_stats_builder = None
     if answer_stats_provider:
         if not isinstance(answer_stats_provider, str):
             raise TypeError("trajectory_export.answer_stats_provider must be a non-empty import path")
-        answer_stats_builder = import_callable(answer_stats_provider)
+        answer_stats_func = import_callable(answer_stats_provider)
+        answer_stats_builder = (
+            answer_stats_func
+            if not answer_stats_kwargs
+            else partial(answer_stats_func, **answer_stats_kwargs)
+        )
     exporter = PromptTrajectoryExporter(
         root_dir=output_dir,
         write_json=export_cfg.get("write_json", True),

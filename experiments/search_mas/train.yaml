@@ -22,13 +22,13 @@ agent_policy_configs:
       policy_name: verifier_model
       train_llm_config:
         enable_thinking: false
-        temperature: 0.2
+        temperature: 0.6
         top_p: 0.95
         top_k: 20
         min_p: 0.0
       val_llm_config:
         enable_thinking: false
-        temperature: 0.0
+        temperature: 0.6
         top_p: 1.0
         top_k: 20
         min_p: 0.0
@@ -43,7 +43,7 @@ agent_policy_configs:
         min_p: 0.0
       val_llm_config:
         enable_thinking: false
-        temperature: 0.0
+        temperature: 0.6
         top_p: 1.0
         top_k: 20
         min_p: 0.0
@@ -52,34 +52,34 @@ agent_policy_configs:
       policy_name: answerer_model
       train_llm_config:
         enable_thinking: false
-        temperature: 0.4
+        temperature: 0.6
         top_p: 0.95
         top_k: 20
         min_p: 0.0
       val_llm_config:
         enable_thinking: false
-        temperature: 0.0
+        temperature: 0.6
         top_p: 1.0
         top_k: 20
         min_p: 0.0
 base_models:
   policy_0:
-    path: /mnt/bn/chenghao1026/models/Qwen3-4B
+    path: /mnt/bn/chenghao-1026-hl/zehan/models/Qwen3-4B
     name: verifier_model
   policy_1:
-    path: /mnt/bn/chenghao1026/models/Qwen3-4B
+    path: /mnt/bn/chenghao-1026-hl/zehan/models/Qwen3-4B
     name: searcher_model
   policy_2:
-    path: /mnt/bn/chenghao1026/models/Qwen3-4B
+    path: /mnt/bn/chenghao-1026-hl/zehan/models/Qwen3-4B
     name: answerer_model
 training:
   rollout_source: mate
   device: cuda
-  total_training_steps: 100
+  total_training_steps: 300
   project_name: orchrl
   experiment_name: search_mas_app
   output_root_dir: outputs/training_runs
-  data_root_dir: /mnt/bn/chenghao1026/zzh/drmas_search_mas
+  data_root_dir: /mnt/bn/chenghao-1026-hl/zehan/datasets/drmas_search_mas
   train_data_path: ${training.data_root_dir}/train.parquet
   val_data_path: ${training.data_root_dir}/test_sampled.parquet
   # val_data_path: ${training.data_root_dir}/test.parquet
@@ -88,10 +88,12 @@ training:
   run_dir: ${training.output_root_dir}/${training.run_name}/${training.run_id}
   logger:
   - console
+  - wandb
+  if_save: false
   model_checkpoints_dir: ${training.run_dir}/checkpoints
   ray_wait_register_center_timeout: 300
-  train_batch_size: 2
-  validate_batch_size: 10
+  train_batch_size: 64
+  validate_batch_size: 40
   train_sample_num: 1
   sample_temperature: 0.6
   val_freq: 5
@@ -108,21 +110,25 @@ training:
     prompt_truncation: left
     batch_size: ${training.train_batch_size}
     # n_samples_per_prompt: ${training.train_sample_num}
-    n_samples_per_prompt: 4
+    n_samples_per_prompt: 5
     rollout_mode: parallel # tree | parallel
     tree:
       k_branches: 4
       max_concurrent_branches: 4
-    max_concurrent_episodes: 8
+    max_concurrent_episodes: 40
     monitor_pool:
-      size: 10
+      size: 45
       host: 127.0.0.1
       base_port: 19000
       acquire_timeout_sec: 300
     timeout: 120
     backend_timeout: 120
     credit_assignment: all_turns
+    failure_policy:
+      mode: threshold
+      max_failed_rate: 0.9
     mas_work_dir: mas_apps/search
+    mas_log_dir: ${training.run_dir}/mas_logs
     mas_command_template: python scripts/run_search_mas.py --config {config_path} --question {prompt}
     config_template_path: mas_apps/search/configs/inference.yaml
     prompt_loader:
@@ -130,8 +136,12 @@ training:
       path: ${training.train_data_path}
       prompt_keys: [question, prompt, query, problem, input]
       expected_keys: [expected_answer, answer, expected_answers, gold_answer, golden_answers, target, label]
+      train_repeat: true
+      train_shuffle: true
+      train_seed: 0
     reward:
       provider: task_plugins.search_mas.reward:compute_reward
+      match_mode: exact
     trajectory_export:
       enable: true
       output_dir: ${training.run_dir}/trajectories
@@ -139,6 +149,8 @@ training:
       write_txt: true
       include_token_details: true
       answer_stats_provider: task_plugins.search_mas.reward:build_answer_stats
+      answer_stats_kwargs:
+        match_mode: exact
 models:
   model_0:
     path: ${base_models.policy_0.path}
@@ -156,20 +168,24 @@ models:
           path: ${base_models.policy_0.path}
           override_config:
             model_id: ${base_models.policy_0.name}
-            #attn_implementation: eager
         actor:
-          ppo_max_token_len_per_gpu: 3072
+          ppo_micro_batch_size_per_gpu: 32
+          ppo_mini_batch_size: 64
+          ppo_max_token_len_per_gpu: 20480
         ref:
-          log_prob_max_token_len_per_gpu: 3072
+          log_prob_micro_batch_size_per_gpu: 4
+          log_prob_max_token_len_per_gpu: 4096
         rollout:
           temperature: ${training.sample_temperature}
           prompt_length: ${training.max_prompt_length}
           response_length: ${training.max_response_length}
           max_model_len: 3072
-          max_num_batched_tokens: 2048
-          max_num_seqs: 8
-          log_prob_max_token_len_per_gpu: 3072
+          max_num_batched_tokens: 4096
+          max_num_seqs: 16
+          log_prob_max_token_len_per_gpu: 4096
           tensor_model_parallel_size: 2
+          enforce_eager: false
+          gpu_memory_utilization: 0.8
           prometheus:
             served_model_name: verifier_model
         trainer:
@@ -191,20 +207,24 @@ models:
           path: ${base_models.policy_1.path}
           override_config:
             model_id: ${base_models.policy_1.name}
-            # attn_implementation: eager
         actor:
-          ppo_max_token_len_per_gpu: 3072
+          ppo_micro_batch_size_per_gpu: 32
+          ppo_mini_batch_size: 64
+          ppo_max_token_len_per_gpu: 20480
         ref:
-          log_prob_max_token_len_per_gpu: 3072
+          log_prob_micro_batch_size_per_gpu: 4
+          log_prob_max_token_len_per_gpu: 4096
         rollout:
           temperature: ${training.sample_temperature}
           prompt_length: ${training.max_prompt_length}
           response_length: ${training.max_response_length}
           max_model_len: 3072
-          max_num_batched_tokens: 2048
-          max_num_seqs: 8
-          log_prob_max_token_len_per_gpu: 3072
+          max_num_batched_tokens: 4096
+          max_num_seqs: 16
+          log_prob_max_token_len_per_gpu: 4096
           tensor_model_parallel_size: 2
+          enforce_eager: false
+          gpu_memory_utilization: 0.8
           prometheus:
             served_model_name: searcher_model
         trainer:
@@ -226,20 +246,24 @@ models:
           path: ${base_models.policy_2.path}
           override_config:
             model_id: ${base_models.policy_2.name}
-            #attn_implementation: eager
         actor:
-          ppo_max_token_len_per_gpu: 3072
+          ppo_micro_batch_size_per_gpu: 32
+          ppo_mini_batch_size: 64
+          ppo_max_token_len_per_gpu: 20480
         ref:
-          log_prob_max_token_len_per_gpu: 3072
+          log_prob_micro_batch_size_per_gpu: 4
+          log_prob_max_token_len_per_gpu: 4096
         rollout:
           temperature: ${training.sample_temperature}
           prompt_length: ${training.max_prompt_length}
           response_length: ${training.max_response_length}
           max_model_len: 3072
-          max_num_batched_tokens: 2048
-          max_num_seqs: 8
-          log_prob_max_token_len_per_gpu: 3072
+          max_num_batched_tokens: 4096
+          max_num_seqs: 16
+          log_prob_max_token_len_per_gpu: 4096
           tensor_model_parallel_size: 2
+          enforce_eager: false
+          gpu_memory_utilization: 0.8
           prometheus:
             served_model_name: answerer_model
         trainer:

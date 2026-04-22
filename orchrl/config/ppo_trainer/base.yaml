@@ -48,11 +48,6 @@ actor_rollout_ref:
     enable_gradient_checkpointing: True
     enable_activation_offload: True
     use_remove_padding: True
-    lora_rank: 0
-    lora_alpha: 16
-    target_modules: all-linear
-    exclude_modules: null
-    lora_adapter_path: null
     use_liger: False
     use_fused_kernels: False
   actor:
@@ -180,7 +175,7 @@ actor_rollout_ref:
       # sampling parameters for validation
       top_k: -1 # 0 for hf rollout, -1 for vllm rollout
       top_p: 1.0
-      temperature: 0
+      temperature: 0.6
       n: 1
       do_sample: False # default eager for validation
     multi_turn:

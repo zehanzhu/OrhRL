@@ -65,6 +65,13 @@ class MateRuntimePromptLimitTests(unittest.TestCase):
             agent_policy_mapping={"searcher": "policy_a"},
         )
         runtime.tokenizer_dict = {"policy_a": "tok-a"}
+        runtime.async_rollout_manager_dict = {
+            "policy_a": mock.Mock(
+                server_addresses=["addr"],
+                server_handles=["handle-a"],
+                global_load_balancer="lb",
+            )
+        }
         runtime.server_handle_dict = {"policy_a": ["handle-a"]}
         runtime.policy_server_name_mapping = {"policy_a": "served-a"}
 

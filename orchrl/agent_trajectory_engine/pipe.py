@@ -23,6 +23,7 @@ class AgentPipeConfig:
     model_mapping: dict[str, ModelMappingEntry]
     timeout: float = 300.0
     mas_work_dir: str | Path | None = None
+    mas_log_dir: str | Path | None = None
 
 
 class AgentPipe:
@@ -60,11 +61,24 @@ class AgentPipe:
                 monitor_url=monitor_url,
                 agent_roles=list(self._config.model_mapping.keys()),
             )
+            stdout_path = None
+            stderr_path = None
+            if self._config.mas_log_dir:
+                stdout_path, stderr_path = await asyncio.to_thread(
+                    launcher.prepare_log_paths,
+                    root_dir=Path(self._config.mas_log_dir),
+                    episode_id=episode_id,
+                )
             command = self._config.mas_command_template.format(
                 config_path=shlex.quote(str(config_path)),
                 prompt=shlex.quote(prompt),
             )
-            process = await asyncio.to_thread(launcher.launch, command=command)
+            process = await asyncio.to_thread(
+                launcher.launch,
+                command=command,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+            )
             exit_code = await asyncio.to_thread(
                 launcher.wait,
                 process,
@@ -81,11 +95,17 @@ class AgentPipe:
                         trajectory=trajectory,
                         rewards={},
                         final_reward=None,
-                        metadata={"exit_code": exit_code},
+                        metadata={
+                            "exit_code": exit_code,
+                            "stdout_log_path": str(stdout_path) if stdout_path else None,
+                            "stderr_log_path": str(stderr_path) if stderr_path else None,
+                        },
                         status="failed",
                         failure_info={
                             "exit_code": exit_code,
                             "reason": "MAS non-zero exit",
+                            "stdout_log_path": str(stdout_path) if stdout_path else None,
+                            "stderr_log_path": str(stderr_path) if stderr_path else None,
                         },
                     )
                     return partial_result
@@ -99,6 +119,10 @@ class AgentPipe:
                 reward_provider,
             )
             result.metadata["exit_code"] = exit_code
+            if stdout_path is not None:
+                result.metadata["stdout_log_path"] = str(stdout_path)
+            if stderr_path is not None:
+                result.metadata["stderr_log_path"] = str(stderr_path)
             return result
         except BaseException as exc:
             primary_error = exc

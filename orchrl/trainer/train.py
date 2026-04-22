@@ -32,6 +32,49 @@ from orchrl.utils.served_model_name import resolve_policy_server_name
 install_cleanup_hooks()
 
 
+def _is_external_mas_reward_flow(config: DictConfig) -> bool:
+    if str(getattr(config, "workflow_type", "")) == "external_mas":
+        return True
+
+    training_cfg = getattr(config, "training", None)
+    if training_cfg is None:
+        return False
+
+    if str(getattr(training_cfg, "rollout_source", "")) == "mate":
+        return True
+
+    mate_cfg = getattr(training_cfg, "mate", None)
+    reward_cfg = getattr(mate_cfg, "reward", None) if mate_cfg is not None else None
+    return bool(getattr(reward_cfg, "provider", None))
+
+
+def _patch_verl_reward_loop_for_external_mas(config: DictConfig) -> None:
+    if not _is_external_mas_reward_flow(config):
+        return
+
+    from verl.experimental.reward_loop import reward_loop as reward_loop_module
+
+    if getattr(reward_loop_module, "_orchrl_external_mas_reward_loop_patched", False):
+        return
+
+    original_init_reward_loop_workers = (
+        reward_loop_module.RewardLoopManager._init_reward_loop_workers
+    )
+
+    def _init_reward_loop_workers(self):
+        # OrchRL external MAS computes rewards via the MATE reward provider,
+        # so VERL generic reward-loop workers are redundant here and clash
+        # across multiple policy trainers because they use fixed Ray actor names.
+        self.reward_loop_workers = None
+        return
+
+    reward_loop_module.RewardLoopManager._orchrl_original_init_reward_loop_workers = (
+        original_init_reward_loop_workers
+    )
+    reward_loop_module.RewardLoopManager._init_reward_loop_workers = _init_reward_loop_workers
+    reward_loop_module._orchrl_external_mas_reward_loop_patched = True
+
+
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config: DictConfig):   
     output_paths = prepare_training_output_dirs(config)
@@ -163,49 +206,6 @@ def train_multi_agents(config):
     trainer.init_mate_rollout_runtime()
     
     trainer.fit()
-
-
-def _is_external_mas_reward_flow(config: DictConfig) -> bool:
-    if str(getattr(config, "workflow_type", "")) == "external_mas":
-        return True
-
-    training_cfg = getattr(config, "training", None)
-    if training_cfg is None:
-        return False
-
-    if str(getattr(training_cfg, "rollout_source", "")) == "mate":
-        return True
-
-    mate_cfg = getattr(training_cfg, "mate", None)
-    reward_cfg = getattr(mate_cfg, "reward", None) if mate_cfg is not None else None
-    return bool(getattr(reward_cfg, "provider", None))
-
-
-def _patch_verl_reward_loop_for_external_mas(config: DictConfig) -> None:
-    if not _is_external_mas_reward_flow(config):
-        return
-
-    from verl.experimental.reward_loop import reward_loop as reward_loop_module
-
-    if getattr(reward_loop_module, "_orchrl_external_mas_reward_loop_patched", False):
-        return
-
-    original_init_reward_loop_workers = (
-        reward_loop_module.RewardLoopManager._init_reward_loop_workers
-    )
-
-    def _init_reward_loop_workers(self):
-        # OrchRL external MAS computes rewards via the MATE reward provider,
-        # so VERL generic reward-loop workers are redundant here and clash
-        # across multiple policy trainers because they use fixed Ray actor names.
-        self.reward_loop_workers = None
-        return
-
-    reward_loop_module.RewardLoopManager._orchrl_original_init_reward_loop_workers = (
-        original_init_reward_loop_workers
-    )
-    reward_loop_module.RewardLoopManager._init_reward_loop_workers = _init_reward_loop_workers
-    reward_loop_module._orchrl_external_mas_reward_loop_patched = True
 
 
 def _expand_single_base_model_role_specific(

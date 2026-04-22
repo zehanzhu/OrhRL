@@ -7,6 +7,11 @@ from orchrl.trainer.specialization_mode import (
     ROLE_SPECIFIC,
     validate_specialization_mode,
 )
+from orchrl.trainer.mate.mas_metrics import (
+    accumulate_mas_metric_stats,
+    finalize_mas_metrics,
+    init_mas_metric_stats,
+)
 from orchrl.utils.performance import colorful_print
 
 
@@ -57,8 +62,12 @@ class ValidationRunner:
     @staticmethod
     def init_validation_stats():
         return {
-            "sample_count": 0,
+            "expected_sample_count": 0,
+            "success_count": 0,
+            "failed_count": 0,
             "reward_sum": 0.0,
+            "correct_count": 0,
+            "mas_metric_stats": init_mas_metric_stats(),
         }
 
     @staticmethod
@@ -69,20 +78,54 @@ class ValidationRunner:
             return float(sum(float(item) for item in value))
         return float(value)
 
-    def accumulate_validation_episode_batch(self, stats, episodes):
+    def accumulate_validation_episode_batch(
+        self,
+        stats,
+        episodes,
+        *,
+        expected_sample_count: int | None = None,
+        failed_count: int = 0,
+    ):
+        if expected_sample_count is None:
+            expected_sample_count = len(episodes)
+        stats["expected_sample_count"] += int(expected_sample_count)
+        stats["success_count"] += len(episodes)
+        stats["failed_count"] += int(failed_count)
+        accumulate_mas_metric_stats(stats["mas_metric_stats"], episodes)
         for episode in episodes:
-            stats["sample_count"] += 1
-            stats["reward_sum"] += self.normalize_validation_reward(
+            reward_value = self.normalize_validation_reward(
                 getattr(episode, "final_reward", 0.0)
             )
+            stats["reward_sum"] += reward_value
+            if reward_value >= 1.0:
+                stats["correct_count"] += 1
 
     @staticmethod
     def build_validation_metrics(stats):
-        sample_count = stats["sample_count"]
+        expected_sample_count = stats["expected_sample_count"]
         sample_avg_reward = (
-            stats["reward_sum"] / sample_count if sample_count > 0 else 0.0
+            stats["reward_sum"] / expected_sample_count if expected_sample_count > 0 else 0.0
         )
-        return {"validation/sample_avg_reward": float(sample_avg_reward)}
+        accuracy = (
+            stats["correct_count"] / expected_sample_count if expected_sample_count > 0 else 0.0
+        )
+        failed_count = int(stats["failed_count"])
+        failed_rate = failed_count / expected_sample_count if expected_sample_count > 0 else 0.0
+        metrics = {
+            "validation/sample_avg_reward": float(sample_avg_reward),
+            "validation/accuracy": float(accuracy),
+            "validation/failed_sample_count": failed_count,
+            "validation/failed_sample_rate": float(failed_rate),
+        }
+        metrics.update(
+            finalize_mas_metrics(
+                stats=stats.get("mas_metric_stats", {}),
+                expected_sample_count=expected_sample_count,
+                failed_count=failed_count,
+                prefix="mas/validation",
+            )
+        )
+        return metrics
 
     def save_best_checkpoint(self, sample_avg_reward):
         if_save = getattr(self.config.training, "if_save", True)
@@ -140,8 +183,17 @@ class ValidationRunner:
     def validate(self, global_steps=0):
         stats = self.init_validation_stats()
 
-        for episode_batch in self.iter_validation_episode_batches():
-            self.accumulate_validation_episode_batch(stats, episode_batch)
+        for rollout_batch in self.iter_validation_episode_batches():
+            episodes = self._extract_rollout_episodes(rollout_batch)
+            self.accumulate_validation_episode_batch(
+                stats,
+                episodes,
+                expected_sample_count=self._rollout_expected_job_count(
+                    rollout_batch,
+                    episodes,
+                ),
+                failed_count=self._rollout_failed_count(rollout_batch),
+            )
 
         validation_metrics = self.build_validation_metrics(stats)
         sample_avg_reward = validation_metrics["validation/sample_avg_reward"]
@@ -150,3 +202,21 @@ class ValidationRunner:
             self.save_best_checkpoint(sample_avg_reward)
 
         return validation_metrics
+
+    @staticmethod
+    def _extract_rollout_episodes(rollout_result):
+        if hasattr(rollout_result, "episodes"):
+            return list(getattr(rollout_result, "episodes") or [])
+        return list(rollout_result or [])
+
+    @staticmethod
+    def _rollout_expected_job_count(rollout_result, episodes) -> int:
+        if hasattr(rollout_result, "expected_job_count"):
+            return int(getattr(rollout_result, "expected_job_count", 0))
+        return len(episodes)
+
+    @staticmethod
+    def _rollout_failed_count(rollout_result) -> int:
+        if hasattr(rollout_result, "failed_count"):
+            return int(getattr(rollout_result, "failed_count", 0))
+        return 0

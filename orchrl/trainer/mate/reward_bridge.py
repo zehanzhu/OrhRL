@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 from orchrl.agent_trajectory_engine import FunctionRewardProvider
@@ -11,4 +12,9 @@ def build_reward_provider(reward_cfg: dict[str, Any]):
     if not isinstance(provider_path, str) or not provider_path:
         raise ValueError("mate.reward.provider must be a non-empty import path")
     func = import_callable(provider_path)
-    return FunctionRewardProvider(func)
+    provider_kwargs = {
+        key: value
+        for key, value in reward_cfg.items()
+        if key != "provider"
+    }
+    return FunctionRewardProvider(partial(func, **provider_kwargs))

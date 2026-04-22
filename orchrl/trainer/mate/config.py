@@ -12,6 +12,11 @@ _DEFAULT_MONITOR_POOL = {
     "acquire_timeout_sec": 300.0,
 }
 
+_DEFAULT_FAILURE_POLICY = {
+    "mode": "threshold",
+    "max_failed_rate": 0.8,
+}
+
 
 def to_plain_dict(mate_cfg: Any) -> dict[str, Any]:
     if OmegaConf.is_config(mate_cfg):
@@ -61,6 +66,27 @@ def _normalize_monitor_pool_config(raw_monitor_pool: Any) -> dict[str, Any]:
     }
 
 
+def _normalize_failure_policy_config(raw_failure_policy: Any) -> dict[str, Any]:
+    failure_policy = dict(_DEFAULT_FAILURE_POLICY)
+    if raw_failure_policy is not None:
+        if not isinstance(raw_failure_policy, Mapping):
+            raise TypeError("mate.failure_policy must be a dict when provided")
+        failure_policy.update(dict(raw_failure_policy))
+
+    mode = str(failure_policy.get("mode", "threshold"))
+    if mode not in {"warn", "threshold", "error"}:
+        raise ValueError("mate.failure_policy.mode must be one of warn/threshold/error")
+
+    max_failed_rate = float(failure_policy.get("max_failed_rate", 0.8))
+    if max_failed_rate < 0:
+        raise ValueError("mate.failure_policy.max_failed_rate must be >= 0")
+
+    return {
+        "mode": mode,
+        "max_failed_rate": max_failed_rate,
+    }
+
+
 def validate_mate_config(mate_cfg: Any, agent_policy_mapping: Mapping[str, str] | None) -> dict[str, Any]:
     config_dict = to_plain_dict(mate_cfg)
     roles = config_dict.get("roles")
@@ -97,4 +123,7 @@ def validate_mate_config(mate_cfg: Any, agent_policy_mapping: Mapping[str, str] 
 
     config_dict["rollout_mode"] = rollout_mode
     config_dict["monitor_pool"] = _normalize_monitor_pool_config(config_dict.get("monitor_pool"))
+    config_dict["failure_policy"] = _normalize_failure_policy_config(
+        config_dict.get("failure_policy")
+    )
     return config_dict

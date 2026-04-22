@@ -131,7 +131,7 @@ python -m pip install -e /path/to/verl
 
 ### 3. Retriever 环境
 
-Search MAS 的本地检索服务建议放在独立 conda 环境里，尤其是 `faiss-gpu`、`datasets` 这类依赖不应混入主训练环境。
+Search MAS 的本地检索服务建议放在独立 conda 环境里，也就是单独的 separate conda environment，尤其是 `faiss-gpu`、`datasets` 这类依赖不应混入主训练环境。
 
 Retriever 的详细准备方式见：
 
@@ -163,6 +163,8 @@ bash experiments/search_mas/run_train_e2e.sh
 3. 设置若干运行环境变量
 4. 调用 `python3 -m orchrl.trainer.train`
 
+训练 launcher 解析训练数据路径时，使用的是 `cfg.training.train_data_path` 和 `cfg.training.val_data_path`，而不是旧文档里提过的 `cfg.training.mate.prompt_loader.path`。
+
 ### 3. 输出会落到哪里
 
 当前输出统一落在 `outputs/` 下。
@@ -173,8 +175,9 @@ bash experiments/search_mas/run_train_e2e.sh
 - 训练运行目录：`outputs/training_runs/<experiment_name>/<run_id>/`
 - checkpoint 根目录：`outputs/training_runs/<experiment_name>/<run_id>/checkpoints`
 - trajectory 导出目录：`outputs/training_runs/<experiment_name>/<run_id>/trajectories`
+- MAS 子进程日志目录：`outputs/training_runs/<experiment_name>/<run_id>/mas_logs`
 
-这些目录会在训练启动时自动创建，不需要手动预建。
+这些目录会在训练启动时 created automatically，不需要手动预建。MAS 子进程的 stdout/stderr 也会按 episode 持久化到 `mas_log_dir` 下，便于排查失败轨迹。
 
 ## 关键配置心智模型
 
@@ -222,6 +225,21 @@ bash experiments/search_mas/run_train_e2e.sh
 - reward provider
 - trajectory export
 - monitor pool
+
+当前实现里，`training.mate.prompt_loader` 还额外决定训练集采样语义：
+
+- `train_repeat`
+- `train_shuffle`
+- `train_seed`
+
+其中训练集会按 `train_repeat/train_shuffle` 做可重复的多轮采样；验证集始终走确定性的全量遍历。
+
+另外还有两组直接影响训练/验证语义的字段：
+
+- `training.mate.reward.match_mode`
+- `training.mate.failure_policy`
+
+`match_mode` 会同时作用于训练 reward、trajectory export answer stats，以及 standalone validation；`failure_policy` 则控制 rollout 失败在训练中是告警还是按阈值中断。
 
 ### 4. 输出路径
 
@@ -316,8 +334,12 @@ bash experiments/search_mas/run_train_e2e.sh
 - 按 `training.validate_batch_size` 分 batch 验证
 - 每个验证样本只 rollout 一条轨迹
 - 验证阶段强制使用 `parallel` 模式，而不是 tree rollout
-- 只统计整个验证集上的 `validation/sample_avg_reward`
-- 逐 batch 更新累计平均值，不保留整套验证 trajectory 在内存中
+- 统计整个验证集上的 `validation/sample_avg_reward`
+- 统计验证准确率 `validation/accuracy`
+- 同时统计 `validation/failed_sample_count` 和 `validation/failed_sample_rate`
+- 同时输出 MAS 系统级指标，例如 `mas/validation/accuracy`、`mas/validation/avg_turns`、`mas/validation/search_call_rate`、`mas/validation/answer_rate`
+- 失败样本会按 expected sample count 计入分母，reward 视为 `0.0`
+- 逐 batch 更新累计平均值，does not retain the full validation trajectory set in memory
 
 ## 与 `mas_apps/search/README.md` 的职责边界
 
@@ -351,6 +373,36 @@ bash experiments/search_mas/run_train_e2e.sh
 - `experiments/search_mas/README.md` 建立实验级心智模型
 - `mas_apps/search/README.md` 建立应用级心智模型
 - `OrchRL_Training_Flow.md` 建立更细的训练执行链路心智模型
+
+## 仓库记忆与 Codex 使用
+
+为了让后续在这个仓库里的 Codex 会话能更稳定地继承上下文，当前仓库已经把关键记忆落成了仓库级文档，而不是只依赖自动 memory 提炼。
+
+建议优先阅读这些文件：
+
+1. `AGENTS.md`
+2. `REPOSITORY_FUNCTION_ANALYSIS.md`
+3. `CODE_REVIEW_FINDINGS.md`
+4. `OrchRL_Training_Flow.md`
+
+其中：
+
+- `AGENTS.md` 记录仓库身份、当前主链路、稳定偏好和仓库级工作约束
+- `REPOSITORY_FUNCTION_ANALYSIS.md` 记录当前仓库实现的功能与细粒度训练链路
+- `CODE_REVIEW_FINDINGS.md` 记录当前已确认的代码 review 问题与验证状态
+- `OrchRL_Training_Flow.md` 记录更细的训练执行路径
+
+如果你希望给这个仓库使用独立的 Codex memory，而不影响用户目录下的 `~/.codex/`，可以从仓库根目录这样启动：
+
+```bash
+CODEX_HOME=$(pwd)/.codex-home codex
+```
+
+这会使用仓库里的 `.codex-home/` 作为本仓库专属 Codex home：
+
+- 不会删除或覆盖 `~/.codex/`
+- 会让这个仓库的 memory/config 与全局 Codex 状态隔离
+- 但自动 memories 仍然只是辅助机制，不能替代上面的仓库级记忆文档
 
 ## 常见问题
 

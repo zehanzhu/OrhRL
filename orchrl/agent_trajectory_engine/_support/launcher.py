@@ -15,6 +15,7 @@ class MASLauncher:
     def __init__(self, work_dir: str | Path | None = None) -> None:
         self._work_dir = Path(work_dir) if work_dir is not None else None
         self._temp_files: list[Path] = []
+        self._open_handles: list[Any] = []
 
     def prepare_config(
         self,
@@ -71,22 +72,40 @@ class MASLauncher:
         self._temp_files.append(config_path)
         return config_path
 
+    def prepare_log_paths(self, *, root_dir: Path, episode_id: str) -> tuple[Path, Path]:
+        root_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = root_dir / f"{episode_id}.stdout.log"
+        stderr_path = root_dir / f"{episode_id}.stderr.log"
+        return stdout_path, stderr_path
+
     def launch(
         self,
         command: str,
         env_vars: dict[str, str] | None = None,
+        *,
+        stdout_path: Path | None = None,
+        stderr_path: Path | None = None,
     ) -> subprocess.Popen[str]:
         env = os.environ.copy()
         if env_vars:
             env.update(env_vars)
+
+        stdout_handle: Any = subprocess.DEVNULL
+        stderr_handle: Any = subprocess.DEVNULL
+        if stdout_path is not None:
+            stdout_handle = open(stdout_path, "w", encoding="utf-8")
+            self._open_handles.append(stdout_handle)
+        if stderr_path is not None:
+            stderr_handle = open(stderr_path, "w", encoding="utf-8")
+            self._open_handles.append(stderr_handle)
 
         return subprocess.Popen(
             command,
             shell=True,
             cwd=str(self._work_dir) if self._work_dir else None,
             env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
             start_new_session=True,
         )
 
@@ -102,6 +121,14 @@ class MASLauncher:
             return process.wait()
 
     def cleanup(self) -> None:
+        remaining_handles: list[Any] = []
+        for handle in self._open_handles:
+            try:
+                handle.close()
+            except OSError:
+                remaining_handles.append(handle)
+        self._open_handles = remaining_handles
+
         remaining: list[Path] = []
         for path in self._temp_files:
             try:

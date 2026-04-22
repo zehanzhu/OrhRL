@@ -202,6 +202,17 @@ class MultiAgentsPPOTrainer:
     def init_workers(self):
         self.policy_trainer_registry.init_workers()
 
+    @staticmethod
+    def _build_tracking_config(config):
+        tracking_config = OmegaConf.to_container(config, resolve=True)
+        if not isinstance(tracking_config, dict):
+            return tracking_config
+
+        trainer_cfg = tracking_config.get("trainer")
+        if not isinstance(trainer_cfg, dict):
+            tracking_config["trainer"] = {}
+        return tracking_config
+
     def _initialize_logger_safely(self):
         from verl.utils.tracking import Tracking
         from datetime import datetime
@@ -220,7 +231,7 @@ class MultiAgentsPPOTrainer:
             project_name=self.config.training.project_name,
             experiment_name=experiment_name,
             default_backend=self.config.training.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
+            config=self._build_tracking_config(self.config),
         )
 
         colorful_print(f"Logger initialized with log_dir: {log_dir}", "cyan")

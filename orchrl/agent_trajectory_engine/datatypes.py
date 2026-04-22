@@ -95,3 +95,30 @@ class TreeEpisodeResult:
     branch_results: list[BranchResult]
     prompt: str
     tree_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RolloutFailure:
+    error_type: str
+    message: str
+    prompt: str | None = None
+    sample_idx: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ParallelRolloutResult:
+    episodes: list[EpisodeResult]
+    expected_job_count: int
+    success_count: int
+    failed_count: int
+    failures: list[RolloutFailure] = field(default_factory=list)
+
+
+@dataclass
+class MateCollectedRollouts:
+    episodes: list[Any]
+    expected_job_count: int
+    success_count: int
+    failed_count: int
+    failures: list[RolloutFailure] = field(default_factory=list)
