@@ -20,6 +20,7 @@ from orchrl.trainer.mate.dataproto_adapter import (
     episodes_to_policy_batches,
     tree_episodes_to_decision_point_batches,
 )
+from orchrl.trainer.mate.mas_metrics import build_mas_metrics
 from orchrl.trainer.mate.trajectory_export import maybe_export_prompt_trajectories
 from orchrl.utils.performance import colorful_print, simple_timer
 
@@ -47,6 +48,13 @@ class TrainingStepExecutor:
         self.mate_runtime = mate_runtime
         self.agent_policy_mapping = agent_policy_mapping or {}
         self.agent_untrained = agent_untrained or []
+        self._last_mate_rollout_accounting = {
+            "expected_job_count": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "failures": [],
+        }
+        self._last_mate_episodes = []
 
     def collect_mate_episodes(self, step_idx: int):
         checkpoint_managers = self.policy_trainer_registry.get_checkpoint_managers()
@@ -63,7 +71,18 @@ class TrainingStepExecutor:
                 checkpoint_manager.sleep_replicas()
 
     def collect_mate_step_batches(self, step_idx: int):
-        episodes = self.collect_mate_episodes(step_idx=step_idx)
+        rollout_result = self.collect_mate_episodes(step_idx=step_idx)
+        episodes = self._extract_rollout_episodes(rollout_result)
+        self._last_mate_episodes = episodes
+        self._last_mate_rollout_accounting = self._build_rollout_accounting(
+            rollout_result,
+            episodes,
+        )
+        self._enforce_rollout_failure_policy(
+            expected_job_count=self._last_mate_rollout_accounting["expected_job_count"],
+            failed_count=self._last_mate_rollout_accounting["failed_count"],
+            failures=self._last_mate_rollout_accounting["failures"],
+        )
         maybe_export_prompt_trajectories(
             episodes=episodes,
             step_idx=step_idx,
@@ -113,6 +132,103 @@ class TrainingStepExecutor:
             ),
         )
 
+    @staticmethod
+    def build_mas_train_metrics(*, episodes, expected_job_count: int, failed_count: int):
+        return build_mas_metrics(
+            episodes=episodes,
+            expected_sample_count=expected_job_count,
+            failed_count=failed_count,
+            prefix="mas/train",
+        )
+
+    @staticmethod
+    def _extract_rollout_episodes(rollout_result):
+        if hasattr(rollout_result, "episodes"):
+            return list(getattr(rollout_result, "episodes") or [])
+        return list(rollout_result or [])
+
+    @staticmethod
+    def _build_rollout_accounting(rollout_result, episodes):
+        if hasattr(rollout_result, "expected_job_count"):
+            return {
+                "expected_job_count": int(getattr(rollout_result, "expected_job_count", 0)),
+                "success_count": int(getattr(rollout_result, "success_count", len(episodes))),
+                "failed_count": int(getattr(rollout_result, "failed_count", 0)),
+                "failures": list(getattr(rollout_result, "failures", []) or []),
+            }
+        return {
+            "expected_job_count": len(episodes),
+            "success_count": len(episodes),
+            "failed_count": 0,
+            "failures": [],
+        }
+
+    def _failure_policy_config(self) -> dict[str, object]:
+        mate_config = getattr(self.mate_runtime, "mate_config", None) or {}
+        failure_policy = dict(mate_config.get("failure_policy") or {})
+        if not failure_policy:
+            raw_training = getattr(self.config, "training", None)
+            raw_mate = getattr(raw_training, "mate", None) if raw_training is not None else None
+            raw_failure_policy = getattr(raw_mate, "failure_policy", None) if raw_mate is not None else None
+            if raw_failure_policy is not None:
+                failure_policy = dict(raw_failure_policy)
+        resolved = {
+            "mode": "threshold",
+            "max_failed_rate": 0.8,
+        }
+        resolved.update(failure_policy)
+        return resolved
+
+    def _enforce_rollout_failure_policy(self, *, expected_job_count, failed_count, failures):
+        if failed_count <= 0:
+            return
+
+        failure_policy = self._failure_policy_config()
+        mode = str(failure_policy.get("mode", "threshold"))
+        failed_rate = failed_count / expected_job_count if expected_job_count > 0 else 0.0
+        sample_failure = failures[:1] if isinstance(failures, list) else []
+
+        if mode == "warn":
+            colorful_print(
+                (
+                    "Warning: rollout job failures detected: "
+                    f"failed={failed_count}/{expected_job_count}"
+                ),
+                "yellow",
+            )
+            return
+
+        if mode == "error":
+            raise RuntimeError(
+                "MATE rollout job failures detected: "
+                f"failed={failed_count}/{expected_job_count}; sample={sample_failure}"
+            )
+
+        if mode != "threshold":
+            raise ValueError("mate.failure_policy.mode must be one of warn/threshold/error")
+
+        max_failed_rate = float(failure_policy.get("max_failed_rate", 0.8))
+        if failed_rate > max_failed_rate:
+            raise RuntimeError(
+                "MATE rollout job failures exceeded threshold: "
+                f"failed={failed_count}/{expected_job_count} "
+                f"(rate={failed_rate:.4f}, max_failed_rate={max_failed_rate}); "
+                f"sample={sample_failure}"
+            )
+
+    @staticmethod
+    def build_rollout_failure_metrics(accounting):
+        expected_job_count = int(accounting.get("expected_job_count", 0))
+        failed_count = int(accounting.get("failed_count", 0))
+        success_count = int(accounting.get("success_count", 0))
+        failed_rate = failed_count / expected_job_count if expected_job_count > 0 else 0.0
+        return {
+            "training/rollout_expected_job_count": expected_job_count,
+            "training/rollout_success_job_count": success_count,
+            "training/rollout_failed_job_count": failed_count,
+            "training/rollout_failed_job_rate": float(failed_rate),
+        }
+
     def mate_rollout_mode(self) -> str:
         if not self.mate_runtime.mate_config:
             return "parallel"
@@ -158,7 +274,6 @@ class TrainingStepExecutor:
         return {
             "training/present_policy_count": len(present_policy_names),
             "training/skipped_policy_count": len(missing_policy_names),
-            "training/skipped_policies": ",".join(missing_policy_names),
         }
 
     @staticmethod
@@ -174,6 +289,20 @@ class TrainingStepExecutor:
 
         with simple_timer("collect_trajectory", timing_raw):
             gen_batch_output_per_policy = self.collect_mate_step_batches(step_idx=step_idx)
+            metrics.update(
+                self.build_rollout_failure_metrics(
+                    self._last_mate_rollout_accounting,
+                )
+            )
+            metrics.update(
+                self.build_mas_train_metrics(
+                    episodes=getattr(self, "_last_mate_episodes", []),
+                    expected_job_count=self._last_mate_rollout_accounting[
+                        "expected_job_count"
+                    ],
+                    failed_count=self._last_mate_rollout_accounting["failed_count"],
+                )
+            )
             present_policy_names, missing_policy_names = self.resolve_mate_policy_batches(
                 gen_batch_output_per_policy
             )

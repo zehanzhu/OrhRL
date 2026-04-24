@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import re
-import unicodedata
 from typing import Any
+
+from task_plugins.search_mas.matching import (
+    extract_tag,
+    is_correct_answer,
+    normalize_text,
+    resolve_match_mode,
+)
 
 
 _ANSWER_KEYS = (
@@ -14,21 +20,6 @@ _ANSWER_KEYS = (
     "target",
     "label",
 )
-
-
-def _extract_tag(text: str, tag: str) -> str:
-    if not isinstance(text, str) or not text.strip():
-        return ""
-    match = re.search(rf"<{tag}>(.*?)</{tag}>", text, flags=re.IGNORECASE | re.DOTALL)
-    return match.group(1).strip() if match else ""
-
-
-def _normalize_text(text: Any) -> str:
-    raw = "" if text is None else str(text)
-    normalized = unicodedata.normalize("NFKD", raw)
-    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    normalized = normalized.strip().lower()
-    return re.sub(r"\s+", " ", normalized)
 
 
 def _parse_stringified_candidates(value: Any) -> list[str]:
@@ -85,7 +76,7 @@ def extract_expected_answers(metadata: dict[str, Any] | None) -> list[str]:
     seen: set[str] = set()
     for candidate in raw_candidates:
         text = str(candidate).strip()
-        normalized = _normalize_text(text)
+        normalized = normalize_text(text)
         if normalized and normalized not in seen:
             seen.add(normalized)
             expected_answers.append(text)
@@ -96,15 +87,22 @@ def extract_predicted_answer(response_text: Any) -> str:
     text = "" if response_text is None else str(response_text).strip()
     if not text:
         return ""
-    return _extract_tag(text, "answer") or text
+    return extract_tag(text, "answer") or text
 
 
-def build_answer_stats(*, response_text: Any, metadata: dict[str, Any] | None) -> dict[str, Any]:
+def build_answer_stats(
+    *,
+    response_text: Any,
+    metadata: dict[str, Any] | None,
+    match_mode: str = "exact",
+) -> dict[str, Any]:
     predicted_answer = extract_predicted_answer(response_text)
     expected_answers = extract_expected_answers(metadata)
-    is_correct = _is_correct(
+    resolved_match_mode = resolve_match_mode(match_mode)
+    is_correct = is_correct_answer(
         predicted_answer,
-        [_normalize_text(candidate) for candidate in expected_answers],
+        expected_answers,
+        match_mode=resolved_match_mode,
     )
     return {
         "predicted_answer": predicted_answer,
@@ -113,30 +111,19 @@ def build_answer_stats(*, response_text: Any, metadata: dict[str, Any] | None) -
     }
 
 
-def build_trajectory_answer_stats(trajectory: Any) -> dict[str, Any]:
+def build_trajectory_answer_stats(trajectory: Any, match_mode: str = "exact") -> dict[str, Any]:
     answer_turns = getattr(trajectory, "agent_trajectories", {}).get("answerer", [])
     response_text = getattr(answer_turns[-1], "response_text", "") if answer_turns else ""
     metadata = getattr(trajectory, "metadata", {})
     return build_answer_stats(
         response_text=response_text,
         metadata=metadata if isinstance(metadata, dict) else {},
+        match_mode=match_mode,
     )
 
 
-def _is_correct(predicted: str, expected_candidates: list[str]) -> bool:
-    normalized_predicted = _normalize_text(predicted)
-    if not normalized_predicted or not expected_candidates:
-        return False
-    return any(
-        normalized_predicted == candidate
-        or normalized_predicted in candidate
-        or candidate in normalized_predicted
-        for candidate in expected_candidates
-    )
-
-
-def compute_reward(trajectory: Any) -> dict[str, Any]:
-    answer_stats = build_trajectory_answer_stats(trajectory)
+def compute_reward(trajectory: Any, match_mode: str = "exact") -> dict[str, Any]:
+    answer_stats = build_trajectory_answer_stats(trajectory, match_mode=match_mode)
     final_reward = 1.0 if answer_stats["is_correct"] else 0.0
 
     return {

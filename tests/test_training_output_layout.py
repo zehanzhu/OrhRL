@@ -43,6 +43,8 @@ class TrainingOutputLayoutTests(unittest.TestCase):
         self.assertIn("run_name:", train_config_text)
         self.assertIn("run_id:", train_config_text)
         self.assertIn("run_dir:", train_config_text)
+        self.assertIn("- wandb", train_config_text)
+        self.assertIn("if_save: false", train_config_text)
         self.assertIn(
             "run_dir: ${training.output_root_dir}/${training.run_name}/${training.run_id}",
             train_config_text,
@@ -72,6 +74,8 @@ class TrainingOutputLayoutTests(unittest.TestCase):
             launcher_text,
         )
         self.assertIn('mkdir -p "$REPO_ROOT/outputs/logs"', launcher_text)
+        self.assertIn('export WANDB_MODE="${WANDB_MODE:-online}"', launcher_text)
+        self.assertNotIn("export WANDB_MODE=offline", launcher_text)
 
     def test_trainer_internal_logs_under_outputs_root(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -177,6 +181,70 @@ class TrainingOutputLayoutTests(unittest.TestCase):
         self.assertEqual(prompts, ["q0", "q1", "q2", "q3", "q4"])
         self.assertEqual(expected, ["a0", "a1", "a2", "a3", "a4"])
 
+    def test_training_loader_repeats_across_epochs_instead_of_exhausting(self):
+        rows = [
+            {"prompt": "q0", "expected": "a0"},
+            {"prompt": "q1", "expected": "a1"},
+            {"prompt": "q2", "expected": "a2"},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            data_path = Path(tmp_dir) / "train.jsonl"
+            data_path.write_text(
+                "\n".join(json.dumps(row, ensure_ascii=True) for row in rows),
+                encoding="utf-8",
+            )
+            loader = MatePromptLoader(
+                source_type="jsonl",
+                path=data_path,
+                prompt_keys=["prompt"],
+                expected_keys=["expected"],
+                repeat=True,
+                shuffle=False,
+                seed=123,
+            )
+
+            batch_0 = loader.get_step_batch(step_idx=0, batch_size=2)
+            batch_1 = loader.get_step_batch(step_idx=1, batch_size=2)
+            batch_2 = loader.get_step_batch(step_idx=2, batch_size=2)
+
+        self.assertEqual([item["prompt"] for item in batch_0], ["q0", "q1"])
+        self.assertEqual([item["prompt"] for item in batch_1], ["q2", "q0"])
+        self.assertEqual([item["prompt"] for item in batch_2], ["q1", "q2"])
+
+    def test_training_loader_shuffle_is_seeded_and_reproducible(self):
+        rows = [{"prompt": f"q{i}", "expected": f"a{i}"} for i in range(4)]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            data_path = Path(tmp_dir) / "train.jsonl"
+            data_path.write_text(
+                "\n".join(json.dumps(row, ensure_ascii=True) for row in rows),
+                encoding="utf-8",
+            )
+            loader_a = MatePromptLoader(
+                source_type="jsonl",
+                path=data_path,
+                prompt_keys=["prompt"],
+                expected_keys=["expected"],
+                repeat=True,
+                shuffle=True,
+                seed=7,
+            )
+            loader_b = MatePromptLoader(
+                source_type="jsonl",
+                path=data_path,
+                prompt_keys=["prompt"],
+                expected_keys=["expected"],
+                repeat=True,
+                shuffle=True,
+                seed=7,
+            )
+
+        self.assertEqual(
+            [item["prompt"] for item in loader_a.get_step_batch(step_idx=0, batch_size=4)],
+            [item["prompt"] for item in loader_b.get_step_batch(step_idx=0, batch_size=4)],
+        )
+
     def test_validation_metrics_are_sample_average_reward_only(self):
         runner = ValidationRunner(
             config=OmegaConf.create(
@@ -215,8 +283,54 @@ class TrainingOutputLayoutTests(unittest.TestCase):
         runner.accumulate_validation_episode_batch(stats, batch_1)
         metrics = runner.build_validation_metrics(stats)
 
-        self.assertEqual(set(metrics.keys()), {"validation/sample_avg_reward"})
+        self.assertNotIn("episodes", stats)
+        self.assertTrue(
+            {
+                "validation/sample_avg_reward",
+                "validation/accuracy",
+                "validation/failed_sample_count",
+                "validation/failed_sample_rate",
+                "mas/validation/sample_avg_reward",
+                "mas/validation/accuracy",
+                "mas/validation/success_rate",
+                "mas/validation/failed_rate",
+            }.issubset(metrics.keys())
+        )
         self.assertAlmostEqual(metrics["validation/sample_avg_reward"], 0.5)
+        self.assertAlmostEqual(metrics["validation/accuracy"], 1 / 3)
+        self.assertEqual(metrics["validation/failed_sample_count"], 0)
+        self.assertAlmostEqual(metrics["validation/failed_sample_rate"], 0.0)
+
+    def test_validation_metrics_use_expected_sample_count_denominator(self):
+        runner = ValidationRunner(
+            config=OmegaConf.create(
+                {"training": {"validate_batch_size": 2, "train_batch_size": 2, "if_save": True}, "specialization": "role_sharing"}
+            ),
+            policy_trainer_registry=None,
+            mate_runtime=None,
+            agent_policy_mapping={},
+        )
+        stats = runner.init_validation_stats()
+
+        runner.accumulate_validation_episode_batch(
+            stats,
+            episodes=[
+                self._build_validation_episode(
+                    episode_id="ep-0",
+                    rewards={},
+                    final_reward=1.0,
+                    turn_counts={},
+                )
+            ],
+            expected_sample_count=2,
+            failed_count=1,
+        )
+        metrics = runner.build_validation_metrics(stats)
+
+        self.assertEqual(metrics["validation/sample_avg_reward"], 0.5)
+        self.assertEqual(metrics["validation/accuracy"], 0.5)
+        self.assertEqual(metrics["validation/failed_sample_count"], 1)
+        self.assertAlmostEqual(metrics["validation/failed_sample_rate"], 0.5)
 
     def test_save_best_checkpoint_compares_sample_average_reward(self):
         trainer = unittest.mock.Mock()

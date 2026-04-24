@@ -1,0 +1,98 @@
+defaults:
+- train
+- _self_
+
+resource:
+  # Use an already-running Ray cluster. For Ray Jobs, "auto" connects from the
+  # submitted driver to the cluster it is running on.
+  ray_address: auto
+  run_training_in_driver: true
+  # Three policy pools each request one 8-GPU placement group.
+  gpus_per_policy: 8
+  policy_nnodes: 1
+  # Force policy placement groups onto worker nodes and keep head for trainer/MAS.
+  policy_bundle_resources:
+    worker: 0.001
+  trainer_remote_num_cpus: 8
+  trainer_remote_resources:
+    byted_driver_resource: 0.01
+  nnodes: 1
+  n_gpus_per_node: 8
+
+training:
+  experiment_name: search_mas_4node_8gpu_per_policy
+  train_batch_size: 64
+  mate:
+    max_concurrent_episodes: 24
+    monitor_pool:
+      size: 24
+      actor_resources:
+        byted_driver_resource: 0.001
+
+models:
+  model_0:
+    ppo_trainer_config:
+      actor_rollout_ref:
+        actor:
+          ppo_micro_batch_size_per_gpu: 4
+          ppo_mini_batch_size: 64
+          ppo_max_token_len_per_gpu: 20480
+        ref:
+          log_prob_micro_batch_size: null
+          log_prob_micro_batch_size_per_gpu: 4
+          log_prob_max_token_len_per_gpu: 20480
+        rollout:
+          n_gpus_per_node: 8
+          tensor_model_parallel_size: 8
+          max_num_batched_tokens: 4096
+          max_num_seqs: 16
+          log_prob_micro_batch_size: null
+          log_prob_micro_batch_size_per_gpu: 4
+          log_prob_max_token_len_per_gpu: 20480
+      trainer:
+        n_gpus_per_node: 8
+        n_training_gpus_per_node: 8
+  model_1:
+    ppo_trainer_config:
+      actor_rollout_ref:
+        actor:
+          ppo_micro_batch_size_per_gpu: 4
+          ppo_mini_batch_size: 64
+          ppo_max_token_len_per_gpu: 20480
+        ref:
+          log_prob_micro_batch_size: null
+          log_prob_micro_batch_size_per_gpu: 4
+          log_prob_max_token_len_per_gpu: 20480
+        rollout:
+          n_gpus_per_node: 8
+          tensor_model_parallel_size: 8
+          max_num_batched_tokens: 4096
+          max_num_seqs: 16
+          log_prob_micro_batch_size: null
+          log_prob_micro_batch_size_per_gpu: 4
+          log_prob_max_token_len_per_gpu: 20480
+      trainer:
+        n_gpus_per_node: 8
+        n_training_gpus_per_node: 8
+  model_2:
+    ppo_trainer_config:
+      actor_rollout_ref:
+        actor:
+          ppo_micro_batch_size_per_gpu: 4
+          ppo_mini_batch_size: 64
+          ppo_max_token_len_per_gpu: 20480
+        ref:
+          log_prob_micro_batch_size: null
+          log_prob_micro_batch_size_per_gpu: 4
+          log_prob_max_token_len_per_gpu: 20480
+        rollout:
+          n_gpus_per_node: 8
+          tensor_model_parallel_size: 8
+          max_num_batched_tokens: 4096
+          max_num_seqs: 16
+          log_prob_micro_batch_size: null
+          log_prob_micro_batch_size_per_gpu: 4
+          log_prob_max_token_len_per_gpu: 20480
+      trainer:
+        n_gpus_per_node: 8
+        n_training_gpus_per_node: 8

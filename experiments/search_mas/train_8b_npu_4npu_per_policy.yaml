@@ -1,0 +1,65 @@
+defaults:
+- train_8b_npu_smoke
+- _self_
+
+training:
+  experiment_name: search_mas_8b_npu_4npu_per_policy
+
+models:
+  model_0:
+    ppo_trainer_config:
+      trainer:
+        device: npu
+        n_gpus_per_node: 4
+        n_training_gpus_per_node: 4
+        total_training_steps: 1
+        save_freq: -1
+        test_freq: -1
+      actor_rollout_ref:
+        actor:
+          fsdp_config:
+            param_offload: true
+            optimizer_offload: true
+        ref:
+          fsdp_config:
+            param_offload: true
+        rollout:
+          tensor_model_parallel_size: 1
+  model_1:
+    ppo_trainer_config:
+      trainer:
+        device: npu
+        n_gpus_per_node: 4
+        n_training_gpus_per_node: 4
+        total_training_steps: 1
+        save_freq: -1
+        test_freq: -1
+      actor_rollout_ref:
+        actor:
+          fsdp_config:
+            param_offload: true
+            optimizer_offload: true
+        ref:
+          fsdp_config:
+            param_offload: true
+        rollout:
+          tensor_model_parallel_size: 1
+  model_2:
+    ppo_trainer_config:
+      trainer:
+        device: npu
+        n_gpus_per_node: 4
+        n_training_gpus_per_node: 4
+        total_training_steps: 1
+        save_freq: -1
+        test_freq: -1
+      actor_rollout_ref:
+        actor:
+          fsdp_config:
+            param_offload: true
+            optimizer_offload: true
+        ref:
+          fsdp_config:
+            param_offload: true
+        rollout:
+          tensor_model_parallel_size: 1

@@ -32,6 +32,7 @@ def main() -> None:
         is_search_answer_correct,
         normalize_answer,
     )
+    from search_mas.apps.search.matching import resolve_match_mode
     from search_mas.core.config import load_yaml_config
 
     config = load_yaml_config(args.config)
@@ -40,7 +41,12 @@ def main() -> None:
     data_cfg = config.get("data", {})
     output_cfg = config.get("output", {})
     val_cfg = config.get("validation", {})
+    match_mode = val_cfg.get("match_mode")
     use_substring_em = bool(val_cfg.get("use_substring_em", False))
+    resolved_match_mode = resolve_match_mode(
+        match_mode,
+        use_substring_em=use_substring_em,
+    )
 
     input_file = args.input_file or data_cfg.get("input_path")
     if not input_file:
@@ -74,7 +80,7 @@ def main() -> None:
             is_correct = is_search_answer_correct(
                 result.final_answer,
                 sample.expected_answers,
-                use_substring=use_substring_em,
+                match_mode=resolved_match_mode,
             )
             score = 1.0 if is_correct else 0.0
 
@@ -120,6 +126,7 @@ def main() -> None:
         "total": total,
         "correct": correct,
         "accuracy": accuracy,
+        "match_mode": resolved_match_mode,
         "use_substring_em": use_substring_em,
         "mismatch_breakdown": dict(sorted(mismatch_types.items())),
         "source_accuracy": source_accuracy,

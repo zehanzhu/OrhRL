@@ -1,11 +1,14 @@
 from pathlib import Path
 from contextlib import ExitStack
 from types import SimpleNamespace
+import asyncio
+import tempfile
 import unittest
 from unittest import mock
 
 from omegaconf import OmegaConf
 
+from orchrl.agent_trajectory_engine.datatypes import EpisodeResult, EpisodeTrajectory, TurnData
 from orchrl.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 
 
@@ -569,6 +572,73 @@ class TrainConfigNormalizationTests(unittest.TestCase):
 
         self.assertEqual(call_count["expand"], 0)
 
+    def test_run_ppo_uses_remote_worker_by_default(self):
+        from orchrl.trainer import train as train_module
+
+        config = OmegaConf.create({"resource": {}})
+        fake_remote_worker = mock.Mock()
+        fake_remote_worker.remote.return_value = "remote-ref"
+
+        with ExitStack() as stack:
+            init_ray_mock = stack.enter_context(
+                mock.patch.object(train_module, "init_ray_with_temp_dirs")
+            )
+            cleanup_mock = stack.enter_context(
+                mock.patch.object(train_module, "cleanup_ray_runtime")
+            )
+            make_remote_mock = stack.enter_context(
+                mock.patch.object(
+                    train_module,
+                    "_make_trainer_remote",
+                    return_value=fake_remote_worker,
+                )
+            )
+            ray_get_mock = stack.enter_context(
+                mock.patch.object(train_module.ray, "get")
+            )
+            train_multi_agents_mock = stack.enter_context(
+                mock.patch.object(train_module, "train_multi_agents")
+            )
+
+            train_module.run_ppo(config)
+
+        init_ray_mock.assert_called_once_with(config)
+        make_remote_mock.assert_called_once_with(config)
+        fake_remote_worker.remote.assert_called_once_with(config)
+        ray_get_mock.assert_called_once_with("remote-ref")
+        train_multi_agents_mock.assert_not_called()
+        cleanup_mock.assert_called_once_with()
+
+    def test_run_ppo_can_execute_training_in_driver(self):
+        from orchrl.trainer import train as train_module
+
+        config = OmegaConf.create({"resource": {"run_training_in_driver": True}})
+
+        with ExitStack() as stack:
+            init_ray_mock = stack.enter_context(
+                mock.patch.object(train_module, "init_ray_with_temp_dirs")
+            )
+            cleanup_mock = stack.enter_context(
+                mock.patch.object(train_module, "cleanup_ray_runtime")
+            )
+            make_remote_mock = stack.enter_context(
+                mock.patch.object(train_module, "_make_trainer_remote")
+            )
+            ray_get_mock = stack.enter_context(
+                mock.patch.object(train_module.ray, "get")
+            )
+            train_multi_agents_mock = stack.enter_context(
+                mock.patch.object(train_module, "train_multi_agents")
+            )
+
+            train_module.run_ppo(config)
+
+        init_ray_mock.assert_called_once_with(config)
+        train_multi_agents_mock.assert_called_once_with(config)
+        make_remote_mock.assert_not_called()
+        ray_get_mock.assert_not_called()
+        cleanup_mock.assert_called_once_with()
+
     def test_multi_agents_trainer_init_workers_delegates_to_registry(self):
         trainer = MultiAgentsPPOTrainer.__new__(MultiAgentsPPOTrainer)
         calls = []
@@ -612,6 +682,7 @@ class TrainConfigNormalizationTests(unittest.TestCase):
                 "runtime",
                 {
                     "tokenizer_dict": {"policy_a": "tok-a"},
+                    "async_rollout_manager_dict": {"policy_a": "async-a"},
                     "server_handle_dict": {"policy_a": ["h-a"]},
                     "policy_server_name_mapping": {"policy_a": "served-a"},
                 },
@@ -679,6 +750,13 @@ class MateRuntimeBehaviorTests(unittest.TestCase):
 
             runtime.initialize(
                 tokenizer_dict={"policy_a": "tok-a"},
+                async_rollout_manager_dict={
+                    "policy_a": mock.Mock(
+                        server_addresses=["addr"],
+                        server_handles=["handle-a"],
+                        global_load_balancer="lb",
+                    )
+                },
                 server_handle_dict={"policy_a": ["handle-a"]},
                 policy_server_name_mapping={"policy_a": "served-a"},
             )
@@ -742,6 +820,7 @@ class MateRuntimeBehaviorTests(unittest.TestCase):
                 "runtime",
                 {
                     "tokenizer_dict": {"policy_a": "tok-a"},
+                    "async_rollout_manager_dict": {"policy_a": "async-a"},
                     "server_handle_dict": {"policy_a": ["h-a"]},
                     "policy_server_name_mapping": {"policy_a": "served-a"},
                 },
@@ -759,6 +838,54 @@ class MateRuntimeBehaviorTests(unittest.TestCase):
 class ValidationRunnerBehaviorTests(unittest.TestCase):
     def _build_episode(self, reward):
         return SimpleNamespace(final_reward=reward)
+
+    def _build_mas_episode(self, *, episode_id, reward, include_search=True):
+        search_turns = [
+            TurnData(
+                agent_role="searcher",
+                turn_index=0,
+                messages=[],
+                response_text="<search>query</search>",
+                token_ids=[3],
+                logprobs=None,
+                finish_reason="stop",
+                timestamp=1.0,
+            )
+        ] if include_search else []
+        return EpisodeResult(
+            trajectory=EpisodeTrajectory(
+                episode_id=episode_id,
+                agent_trajectories={
+                    "verifier": [
+                        TurnData(
+                            agent_role="verifier",
+                            turn_index=0,
+                            messages=[],
+                            response_text="<verify>yes</verify>",
+                            token_ids=[1],
+                            logprobs=None,
+                            finish_reason="stop",
+                            timestamp=0.0,
+                        )
+                    ],
+                    "searcher": search_turns,
+                    "answerer": [
+                        TurnData(
+                            agent_role="answerer",
+                            turn_index=0,
+                            messages=[],
+                            response_text="<answer>answer</answer>",
+                            token_ids=[4],
+                            logprobs=None,
+                            finish_reason="stop",
+                            timestamp=2.0,
+                        )
+                    ],
+                },
+            ),
+            rewards={"verifier": reward, "answerer": reward},
+            final_reward=reward,
+        )
 
     def test_validation_runner_iterates_batches_computes_sample_average_reward_and_saves_best(self):
         from orchrl.trainer.validation_runner import ValidationRunner
@@ -808,11 +935,84 @@ class ValidationRunnerBehaviorTests(unittest.TestCase):
 
         metrics = runner.validate(global_steps=1)
 
-        self.assertEqual(metrics, {"validation/sample_avg_reward": 0.5})
+        self.assertEqual(metrics["validation/sample_avg_reward"], 0.5)
+        self.assertAlmostEqual(metrics["validation/accuracy"], 1 / 3)
+        self.assertEqual(metrics["validation/failed_sample_count"], 0)
+        self.assertEqual(metrics["validation/failed_sample_rate"], 0.0)
+        self.assertEqual(metrics["mas/validation/sample_avg_reward"], 0.5)
+        self.assertAlmostEqual(metrics["mas/validation/accuracy"], 1 / 3)
+        self.assertEqual(metrics["mas/validation/success_rate"], 1.0)
+        self.assertEqual(metrics["mas/validation/failed_rate"], 0.0)
         checkpoint_manager.update_weights.assert_called_once_with()
         checkpoint_manager.sleep_replicas.assert_called_once_with()
         trainer._save_checkpoint.assert_called_once_with()
         self.assertEqual(runner.best_validation_reward, 0.5)
+
+    def test_validation_runner_reports_mas_level_behavior_metrics(self):
+        from orchrl.agent_trajectory_engine.datatypes import MateCollectedRollouts
+        from orchrl.trainer.validation_runner import ValidationRunner
+
+        rollout_batches = [
+            MateCollectedRollouts(
+                episodes=[
+                    self._build_mas_episode(
+                        episode_id="ep-0",
+                        reward=1.0,
+                        include_search=True,
+                    )
+                ],
+                expected_job_count=2,
+                success_count=1,
+                failed_count=1,
+                failures=[],
+            )
+        ]
+
+        async def collect_prompt_batch_rollouts(*, prompts, n_samples_per_prompt):
+            return rollout_batches.pop(0)
+
+        registry = SimpleNamespace(
+            get_checkpoint_managers=lambda: {},
+            ppo_trainer_dict={},
+        )
+        mate_runtime = SimpleNamespace(
+            mate_val_prompt_loader=SimpleNamespace(
+                iter_batches=lambda batch_size: iter([[{"prompt": "q0"}, {"prompt": "q1"}]])
+            ),
+            mate_val_rollout_adapter=SimpleNamespace(
+                collect_prompt_batch_rollouts=collect_prompt_batch_rollouts
+            ),
+        )
+        runner = ValidationRunner(
+            config=OmegaConf.create(
+                {
+                    "training": {
+                        "validate_batch_size": 2,
+                        "train_batch_size": 4,
+                        "if_save": False,
+                    },
+                    "specialization": "role_sharing",
+                }
+            ),
+            policy_trainer_registry=registry,
+            mate_runtime=mate_runtime,
+            agent_policy_mapping={},
+        )
+
+        metrics = runner.validate(global_steps=1)
+
+        self.assertEqual(metrics["validation/sample_avg_reward"], 0.5)
+        self.assertEqual(metrics["validation/accuracy"], 0.5)
+        self.assertEqual(metrics["validation/failed_sample_rate"], 0.5)
+        self.assertEqual(metrics["mas/validation/sample_avg_reward"], 0.5)
+        self.assertEqual(metrics["mas/validation/accuracy"], 0.5)
+        self.assertEqual(metrics["mas/validation/success_rate"], 0.5)
+        self.assertEqual(metrics["mas/validation/failed_rate"], 0.5)
+        self.assertEqual(metrics["mas/validation/avg_turns"], 3.0)
+        self.assertEqual(metrics["mas/validation/avg_search_calls"], 1.0)
+        self.assertEqual(metrics["mas/validation/search_call_rate"], 1.0)
+        self.assertEqual(metrics["mas/validation/answer_rate"], 1.0)
+        self.assertEqual(metrics["mas/validation/verifier_yes_rate"], 1.0)
 
     def test_multi_agents_trainer_validate_delegates_to_validation_runner(self):
         trainer = MultiAgentsPPOTrainer.__new__(MultiAgentsPPOTrainer)
@@ -826,6 +1026,82 @@ class ValidationRunnerBehaviorTests(unittest.TestCase):
 
         self.assertEqual(metrics, {"validation/sample_avg_reward": 0.75})
         self.assertEqual(trainer.best_validation_reward, 0.75)
+
+
+class RolloutAccountingTests(unittest.TestCase):
+    def test_parallel_rollout_returns_expected_success_and_failure_counts(self):
+        from orchrl.agent_trajectory_engine.parallel import _summarize_parallel_results
+
+        results = _summarize_parallel_results(
+            prompts=["q0", "q1"],
+            gathered=[
+                "ep-0",
+                RuntimeError("boom"),
+            ],
+            n_samples_per_prompt=1,
+        )
+
+        self.assertEqual(results.expected_job_count, 2)
+        self.assertEqual(results.success_count, 1)
+        self.assertEqual(results.failed_count, 1)
+
+    def test_mate_rollout_adapter_surfaces_job_accounting(self):
+        from orchrl.trainer.mate.rollout_adapter import MateRolloutAdapter
+
+        adapter = MateRolloutAdapter(
+            config={
+                "roles": ["searcher"],
+                "role_policy_mapping": {"searcher": "policy_a"},
+                "batch_size": 2,
+                "n_samples_per_prompt": 1,
+                "rollout_mode": "parallel",
+                "mas_command_template": "python run.py --config {config_path}",
+                "config_template": {"llm": {}, "agents": {}},
+            },
+            prompt_loader=mock.Mock(),
+            reward_provider=mock.Mock(),
+            role_policy_mapping={"searcher": "policy_a"},
+            policy_server_name_mapping={"policy_a": "served-a"},
+            monitor_pool_manager=mock.Mock(),
+        )
+
+        async def fake_parallel_rollout(**kwargs):
+            prompts = list(kwargs["prompts"])
+            if prompts == ["q0"]:
+                return SimpleNamespace(
+                    episodes=[
+                        SimpleNamespace(
+                            metadata={},
+                            trajectory=SimpleNamespace(metadata={}),
+                        )
+                    ],
+                    expected_job_count=1,
+                    success_count=1,
+                    failed_count=0,
+                    failures=[],
+                )
+            return SimpleNamespace(
+                episodes=[],
+                expected_job_count=1,
+                success_count=0,
+                failed_count=1,
+                failures=[{"error_type": "RuntimeError", "message": "boom"}],
+            )
+
+        with mock.patch(
+            "orchrl.trainer.mate.rollout_adapter.parallel_rollout",
+            side_effect=fake_parallel_rollout,
+        ):
+            result = asyncio.run(
+                adapter.collect_prompt_batch_rollouts(
+                    prompts=[{"prompt": "q0"}, {"prompt": "q1"}],
+                    n_samples_per_prompt=1,
+                )
+            )
+
+        self.assertEqual(result.expected_job_count, 2)
+        self.assertEqual(result.failed_count, 1)
+        self.assertEqual(len(result.episodes), 1)
 
 
 class OrchRLCodeHygieneTests(unittest.TestCase):
@@ -959,6 +1235,63 @@ class MultiAgentsTrainerResumeBehaviorTests(unittest.TestCase):
 
 
 class TrainingStepExecutorBehaviorTests(unittest.TestCase):
+    def _build_mas_episode(self, *, final_reward=1.0):
+        return EpisodeResult(
+            trajectory=EpisodeTrajectory(
+                episode_id="ep-train",
+                agent_trajectories={
+                    "verifier": [
+                        TurnData(
+                            agent_role="verifier",
+                            turn_index=0,
+                            messages=[],
+                            response_text="<verify>no</verify>",
+                            token_ids=[1],
+                            logprobs=None,
+                            finish_reason="stop",
+                            timestamp=0.0,
+                        ),
+                        TurnData(
+                            agent_role="verifier",
+                            turn_index=1,
+                            messages=[],
+                            response_text="<verify>yes</verify>",
+                            token_ids=[2],
+                            logprobs=None,
+                            finish_reason="stop",
+                            timestamp=3.0,
+                        ),
+                    ],
+                    "searcher": [
+                        TurnData(
+                            agent_role="searcher",
+                            turn_index=0,
+                            messages=[],
+                            response_text="<search>query</search>",
+                            token_ids=[3],
+                            logprobs=None,
+                            finish_reason="stop",
+                            timestamp=1.0,
+                        )
+                    ],
+                    "answerer": [
+                        TurnData(
+                            agent_role="answerer",
+                            turn_index=0,
+                            messages=[],
+                            response_text="<answer>answer</answer>",
+                            token_ids=[4],
+                            logprobs=None,
+                            finish_reason="stop",
+                            timestamp=4.0,
+                        )
+                    ],
+                },
+            ),
+            rewards={"verifier": final_reward, "searcher": final_reward, "answerer": final_reward},
+            final_reward=final_reward,
+        )
+
     def test_step_executor_collects_policy_batches_and_exports_trajectories(self):
         from orchrl.trainer.training_step_executor import TrainingStepExecutor
 
@@ -1045,7 +1378,19 @@ class TrainingStepExecutorBehaviorTests(unittest.TestCase):
             agent_policy_mapping={},
             agent_untrained=[],
         )
-        executor.collect_mate_step_batches = mock.Mock(return_value={"policy_a": fake_batch})
+        def collect_mate_step_batches(step_idx):
+            executor._last_mate_episodes = [self._build_mas_episode(final_reward=1.0)]
+            executor._last_mate_rollout_accounting = {
+                "expected_job_count": 2,
+                "success_count": 1,
+                "failed_count": 1,
+                "failures": [],
+            }
+            return {"policy_a": fake_batch}
+
+        executor.collect_mate_step_batches = mock.Mock(
+            side_effect=collect_mate_step_batches
+        )
         executor.filter_batch_by_existing_uid_groups = mock.Mock(
             side_effect=lambda data_proto, filter_ratio, mode: data_proto
         )
@@ -1062,7 +1407,16 @@ class TrainingStepExecutorBehaviorTests(unittest.TestCase):
         self.assertEqual(result.batch_per_trainer["policy_a"], fake_batch)
         self.assertEqual(result.metrics["training/present_policy_count"], 1)
         self.assertEqual(result.metrics["training/skipped_policy_count"], 1)
-        self.assertEqual(result.metrics["training/skipped_policies"], "policy_b")
+        self.assertNotIn("training/skipped_policies", result.metrics)
+        for metric_name, metric_value in result.metrics.items():
+            self.assertIsInstance(
+                metric_value,
+                (int, float),
+                f"{metric_name} should be a numeric scalar metric",
+            )
+        self.assertEqual(result.metrics["mas/train/sample_avg_reward"], 0.5)
+        self.assertEqual(result.metrics["mas/train/success_rate"], 0.5)
+        self.assertEqual(result.metrics["mas/train/failed_rate"], 0.5)
         executor.update_parameters.assert_called_once_with(
             fake_batch,
             trainer_a,
@@ -1070,6 +1424,79 @@ class TrainingStepExecutorBehaviorTests(unittest.TestCase):
         )
         self.assertIn("collect_trajectory", result.timing_raw)
         self.assertIn("update_parameters", result.timing_raw)
+
+    def test_step_executor_reports_mas_level_train_metrics(self):
+        from orchrl.agent_trajectory_engine.datatypes import MateCollectedRollouts
+        from orchrl.trainer.training_step_executor import TrainingStepExecutor
+
+        episode = self._build_mas_episode(final_reward=1.0)
+        rollout_result = MateCollectedRollouts(
+            episodes=[episode],
+            expected_job_count=2,
+            success_count=1,
+            failed_count=1,
+            failures=[],
+        )
+        registry = SimpleNamespace(
+            get_checkpoint_managers=lambda: {},
+            get_tokenizers=lambda: {"policy_a": "tok-a"},
+            ppo_trainer_dict={
+                "policy_a": SimpleNamespace(
+                    config=OmegaConf.create(
+                        {"data": {"max_prompt_length": 32, "max_response_length": 16}}
+                    )
+                )
+            },
+        )
+        async def collect_step_rollouts(*, step_idx):
+            return rollout_result
+
+        mate_runtime = SimpleNamespace(
+            mate_rollout_adapter=SimpleNamespace(
+                collect_step_rollouts=collect_step_rollouts
+            ),
+            mate_config={
+                "role_policy_mapping": {"verifier": "policy_a"},
+                "rollout_mode": "parallel",
+                "failure_policy": {"mode": "threshold", "max_failed_rate": 0.8},
+            },
+        )
+
+        with (
+            mock.patch("orchrl.trainer.training_step_executor.maybe_export_prompt_trajectories"),
+            mock.patch(
+                "orchrl.trainer.training_step_executor.episodes_to_policy_batches",
+                return_value={"policy_a": "batch-a"},
+            ),
+        ):
+            executor = TrainingStepExecutor(
+                config=OmegaConf.create(
+                    {"training": {"max_prompt_length": None, "max_response_length": None}}
+                ),
+                policy_trainer_registry=registry,
+                mate_runtime=mate_runtime,
+                agent_policy_mapping={"verifier": "policy_a"},
+                agent_untrained=[],
+            )
+            executor.collect_mate_step_batches(step_idx=3)
+
+        accounting = executor._last_mate_rollout_accounting
+        self.assertEqual(accounting["failed_count"], 1)
+        metrics = executor.build_mas_train_metrics(
+            episodes=[episode],
+            expected_job_count=accounting["expected_job_count"],
+            failed_count=accounting["failed_count"],
+        )
+
+        self.assertEqual(metrics["mas/train/sample_avg_reward"], 0.5)
+        self.assertEqual(metrics["mas/train/success_rate"], 0.5)
+        self.assertEqual(metrics["mas/train/failed_rate"], 0.5)
+        self.assertEqual(metrics["mas/train/avg_turns"], 4.0)
+        self.assertEqual(metrics["mas/train/avg_search_calls"], 1.0)
+        self.assertEqual(metrics["mas/train/search_call_rate"], 1.0)
+        self.assertEqual(metrics["mas/train/answer_rate"], 1.0)
+        self.assertEqual(metrics["mas/train/verifier_yes_rate"], 0.5)
+        self.assertEqual(metrics["mas/train/verifier_no_rate"], 0.5)
 
     def test_multi_agents_trainer_collect_phase_delegates_to_training_step_executor(self):
         trainer = MultiAgentsPPOTrainer.__new__(MultiAgentsPPOTrainer)
@@ -1081,6 +1508,183 @@ class TrainingStepExecutorBehaviorTests(unittest.TestCase):
         collected = trainer.fit_one_collect_phase_for_test()
 
         self.assertEqual(collected, {"policy_a": "batch-4"})
+
+
+class TrainingFailurePolicyTests(unittest.TestCase):
+    def _build_executor(self, *, failure_policy):
+        from orchrl.trainer.training_step_executor import TrainingStepExecutor
+
+        return TrainingStepExecutor(
+            config=OmegaConf.create(
+                {
+                    "training": {
+                        "mate": {
+                            "failure_policy": failure_policy,
+                        }
+                    }
+                }
+            ),
+            policy_trainer_registry=mock.Mock(),
+            mate_runtime=SimpleNamespace(
+                mate_config={
+                    "failure_policy": failure_policy,
+                }
+            ),
+            agent_policy_mapping={},
+            agent_untrained=[],
+        )
+
+    def test_training_step_allows_small_failure_below_threshold(self):
+        executor = self._build_executor(
+            failure_policy={
+                "mode": "threshold",
+                "max_failed_jobs": 1,
+                "max_failed_rate": 0.5,
+            }
+        )
+
+        executor._enforce_rollout_failure_policy(
+            expected_job_count=4,
+            failed_count=1,
+            failures=[{"message": "boom"}],
+        )
+
+    def test_training_step_threshold_is_controlled_only_by_failure_rate(self):
+        executor = self._build_executor(
+            failure_policy={
+                "mode": "threshold",
+                "max_failed_jobs": 1,
+                "max_failed_rate": 0.5,
+            }
+        )
+
+        executor._enforce_rollout_failure_policy(
+            expected_job_count=10,
+            failed_count=2,
+            failures=[{"message": "boom-0"}, {"message": "boom-1"}],
+        )
+
+    def test_training_step_raises_when_failure_threshold_exceeded(self):
+        executor = self._build_executor(
+            failure_policy={
+                "mode": "threshold",
+                "max_failed_jobs": 1,
+                "max_failed_rate": 0.2,
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "rollout job failures"):
+            executor._enforce_rollout_failure_policy(
+                expected_job_count=4,
+                failed_count=2,
+                failures=[{"message": "boom-0"}, {"message": "boom-1"}],
+        )
+
+    def test_training_step_default_threshold_allows_failures_below_eighty_percent(self):
+        executor = self._build_executor(failure_policy={})
+
+        executor._enforce_rollout_failure_policy(
+            expected_job_count=10,
+            failed_count=5,
+            failures=[{"message": "boom"}],
+        )
+
+    def test_training_step_default_threshold_raises_above_eighty_percent(self):
+        executor = self._build_executor(failure_policy={})
+
+        with self.assertRaisesRegex(RuntimeError, "rollout job failures"):
+            executor._enforce_rollout_failure_policy(
+                expected_job_count=10,
+                failed_count=9,
+                failures=[{"message": "boom"}],
+            )
+
+
+class MateFailurePolicyConfigTests(unittest.TestCase):
+    def test_failure_policy_normalization_defaults_rate_threshold_to_eighty_percent(self):
+        from orchrl.trainer.mate.config import validate_mate_config
+
+        config = validate_mate_config(
+            {
+                "roles": ["searcher"],
+                "role_policy_mapping": {"searcher": "policy_a"},
+                "rollout_mode": "parallel",
+            },
+            {"searcher": "policy_a"},
+        )
+
+        self.assertEqual(
+            config["failure_policy"],
+            {
+                "mode": "threshold",
+                "max_failed_rate": 0.8,
+            },
+        )
+
+    def test_failure_policy_normalization_drops_legacy_job_count_threshold(self):
+        from orchrl.trainer.mate.config import validate_mate_config
+
+        config = validate_mate_config(
+            {
+                "roles": ["searcher"],
+                "role_policy_mapping": {"searcher": "policy_a"},
+                "rollout_mode": "parallel",
+                "failure_policy": {
+                    "mode": "threshold",
+                    "max_failed_jobs": 1,
+                    "max_failed_rate": 0.5,
+                },
+            },
+            {"searcher": "policy_a"},
+        )
+
+        self.assertEqual(
+            config["failure_policy"],
+            {
+                "mode": "threshold",
+                "max_failed_rate": 0.5,
+            },
+        )
+
+
+class MASLauncherLoggingTests(unittest.TestCase):
+    def test_launcher_accepts_explicit_log_paths(self):
+        from orchrl.agent_trajectory_engine._support.launcher import MASLauncher
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            launcher = MASLauncher(work_dir=tmp_dir)
+            stdout_path, stderr_path = launcher.prepare_log_paths(
+                root_dir=Path(tmp_dir) / "logs",
+                episode_id="ep-1",
+            )
+
+        self.assertTrue(str(stdout_path).endswith("ep-1.stdout.log"))
+        self.assertTrue(str(stderr_path).endswith("ep-1.stderr.log"))
+
+
+class MultiAgentsTrainerLoggingCompatibilityTests(unittest.TestCase):
+    def test_logger_initialization_provides_top_level_trainer_config_for_tracking(self):
+        trainer = MultiAgentsPPOTrainer.__new__(MultiAgentsPPOTrainer)
+        trainer.config = OmegaConf.create(
+            {
+                "training": {
+                    "project_name": "orchrl",
+                    "experiment_name": "wandb-compat-test",
+                    "logger": ["console", "wandb"],
+                }
+            }
+        )
+
+        with mock.patch("verl.utils.tracking.Tracking") as tracking_cls:
+            trainer._initialize_logger_safely()
+
+        tracking_kwargs = tracking_cls.call_args.kwargs
+        self.assertEqual(tracking_kwargs["project_name"], "orchrl")
+        self.assertEqual(tracking_kwargs["experiment_name"], "wandb-compat-test")
+        self.assertEqual(tracking_kwargs["default_backend"], ["console", "wandb"])
+        self.assertIn("training", tracking_kwargs["config"])
+        self.assertIn("trainer", tracking_kwargs["config"])
+        self.assertEqual(tracking_kwargs["config"]["trainer"], {})
 
 
 if __name__ == "__main__":

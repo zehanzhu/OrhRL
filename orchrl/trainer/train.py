@@ -32,6 +32,49 @@ from orchrl.utils.served_model_name import resolve_policy_server_name
 install_cleanup_hooks()
 
 
+def _is_external_mas_reward_flow(config: DictConfig) -> bool:
+    if str(getattr(config, "workflow_type", "")) == "external_mas":
+        return True
+
+    training_cfg = getattr(config, "training", None)
+    if training_cfg is None:
+        return False
+
+    if str(getattr(training_cfg, "rollout_source", "")) == "mate":
+        return True
+
+    mate_cfg = getattr(training_cfg, "mate", None)
+    reward_cfg = getattr(mate_cfg, "reward", None) if mate_cfg is not None else None
+    return bool(getattr(reward_cfg, "provider", None))
+
+
+def _patch_verl_reward_loop_for_external_mas(config: DictConfig) -> None:
+    if not _is_external_mas_reward_flow(config):
+        return
+
+    from verl.experimental.reward_loop import reward_loop as reward_loop_module
+
+    if getattr(reward_loop_module, "_orchrl_external_mas_reward_loop_patched", False):
+        return
+
+    original_init_reward_loop_workers = (
+        reward_loop_module.RewardLoopManager._init_reward_loop_workers
+    )
+
+    def _init_reward_loop_workers(self):
+        # OrchRL external MAS computes rewards via the MATE reward provider,
+        # so VERL generic reward-loop workers are redundant here and clash
+        # across multiple policy trainers because they use fixed Ray actor names.
+        self.reward_loop_workers = None
+        return
+
+    reward_loop_module.RewardLoopManager._orchrl_original_init_reward_loop_workers = (
+        original_init_reward_loop_workers
+    )
+    reward_loop_module.RewardLoopManager._init_reward_loop_workers = _init_reward_loop_workers
+    reward_loop_module._orchrl_external_mas_reward_loop_patched = True
+
+
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config: DictConfig):   
     output_paths = prepare_training_output_dirs(config)
@@ -48,16 +91,38 @@ def run_ppo(config):
     try:
         # Initialize Ray with temporary directories
         init_ray_with_temp_dirs(config)
-        
-        # Create and execute remote trainer
-        def make_trainer_remote():
-            num_cpus = max(8, int(ray.cluster_resources()["CPU"] * 0.1)) 
-            return ray.remote(num_cpus=num_cpus)(train_multi_agents)
 
-        multiagent_training_engine = make_trainer_remote()
-        ray.get(multiagent_training_engine.remote(config))
+        if _run_training_in_driver(config):
+            train_multi_agents(config)
+        else:
+            multiagent_training_engine = _make_trainer_remote(config)
+            ray.get(multiagent_training_engine.remote(config))
     finally:
         cleanup_ray_runtime()
+
+
+def _run_training_in_driver(config) -> bool:
+    resource_cfg = getattr(config, "resource", None)
+    if resource_cfg is None:
+        return False
+    return bool(getattr(resource_cfg, "run_training_in_driver", False))
+
+
+def _make_trainer_remote(config):
+    resource_cfg = getattr(config, "resource", None)
+    configured_num_cpus = getattr(resource_cfg, "trainer_remote_num_cpus", None)
+    if configured_num_cpus is None:
+        configured_num_cpus = max(8, int(ray.cluster_resources()["CPU"] * 0.1))
+
+    trainer_remote_options = {"num_cpus": int(configured_num_cpus)}
+    configured_resources = getattr(resource_cfg, "trainer_remote_resources", None)
+    if configured_resources:
+        trainer_remote_options["resources"] = OmegaConf.to_container(
+            configured_resources, resolve=True
+        )
+
+    return ray.remote(**trainer_remote_options)(train_multi_agents)
+
 
 def train_multi_agents(config):
     from omegaconf import OmegaConf
@@ -103,17 +168,12 @@ def train_multi_agents(config):
 
     _validate_unique_role_specific_served_model_names(config)
 
-    n_gpus_per_node = getattr(config.resource, 'n_gpus_per_node', 1)
-    nnodes = getattr(config.resource, 'nnodes', 1)
     OmegaConf.to_container(config, resolve=True)
-    #pprint(OmegaConf.to_container(config, resolve=True))
     OmegaConf.resolve(config)
     
     tokenizer_dict = {}
-    model_num = 0
 
     for model_key, model_config in config.models.items():
-        model_num += 1
         model_path = model_config.path
         model_name = model_config.name
         
@@ -128,27 +188,11 @@ def train_multi_agents(config):
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         tokenizer_dict[model_name] = tokenizer
 
-    n_gpus_per_model = n_gpus_per_node // model_num
-    print(f"n_gpus_per_model: {n_gpus_per_model}")
-    
     role_worker_mapping = {
-        Role.ActorRollout: ray.remote(max_concurrency=2048)(AsyncActorRolloutRefWorker),
+        Role.ActorRolloutRef: ray.remote(max_concurrency=2048)(AsyncActorRolloutRefWorker),
     }
-    
-    managers = []
-    for model_key, model_config in config.models.items():
-        global_pool_id = f"global_pool_{model_key}"
-        resource_pool_spec = {global_pool_id: [n_gpus_per_model] * nnodes}
-        mapping = {
-            Role.ActorRollout: global_pool_id,
-            Role.Critic: global_pool_id,
-            Role.RefPolicy: global_pool_id,
-        }
-        
-        #print(f"Creating resource pool for {model_key}: {resource_pool_spec}")
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
-        resource_pool_manager.create_resource_pool()
-        managers.append(resource_pool_manager)
+
+    managers = _build_policy_resource_pool_managers(config)
     
     trainer = MultiAgentsPPOTrainer(
         config=config,
@@ -165,47 +209,39 @@ def train_multi_agents(config):
     trainer.fit()
 
 
-def _is_external_mas_reward_flow(config: DictConfig) -> bool:
-    if str(getattr(config, "workflow_type", "")) == "external_mas":
-        return True
+def _build_policy_resource_pool_managers(config):
+    from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
-    training_cfg = getattr(config, "training", None)
-    if training_cfg is None:
-        return False
-
-    if str(getattr(training_cfg, "rollout_source", "")) == "mate":
-        return True
-
-    mate_cfg = getattr(training_cfg, "mate", None)
-    reward_cfg = getattr(mate_cfg, "reward", None) if mate_cfg is not None else None
-    return bool(getattr(reward_cfg, "provider", None))
-
-
-def _patch_verl_reward_loop_for_external_mas(config: DictConfig) -> None:
-    if not _is_external_mas_reward_flow(config):
-        return
-
-    from verl.experimental.reward_loop import reward_loop as reward_loop_module
-
-    if getattr(reward_loop_module, "_orchrl_external_mas_reward_loop_patched", False):
-        return
-
-    original_init_reward_loop_workers = (
-        reward_loop_module.RewardLoopManager._init_reward_loop_workers
+    resource_cfg = getattr(config, "resource", None)
+    n_gpus_per_node = int(getattr(resource_cfg, "n_gpus_per_node", 1))
+    configured_gpus_per_policy = getattr(resource_cfg, "gpus_per_policy", None)
+    gpus_per_policy = int(configured_gpus_per_policy or n_gpus_per_node)
+    policy_nnodes = int(getattr(resource_cfg, "policy_nnodes", 1))
+    bundle_resources_cfg = getattr(resource_cfg, "policy_bundle_resources", None)
+    bundle_resources = (
+        OmegaConf.to_container(bundle_resources_cfg, resolve=True)
+        if bundle_resources_cfg
+        else None
     )
 
-    def _init_reward_loop_workers(self):
-        # OrchRL external MAS computes rewards via the MATE reward provider,
-        # so VERL generic reward-loop workers are redundant here and clash
-        # across multiple policy trainers because they use fixed Ray actor names.
-        self.reward_loop_workers = None
-        return
+    managers = []
+    for model_key in config.models.keys():
+        global_pool_id = f"global_pool_{model_key}"
+        resource_pool_spec = {global_pool_id: [gpus_per_policy] * policy_nnodes}
+        mapping = {
+            Role.ActorRolloutRef: global_pool_id,
+            Role.Critic: global_pool_id,
+            Role.RefPolicy: global_pool_id,
+        }
+        manager = ResourcePoolManager(
+            resource_pool_spec=resource_pool_spec,
+            mapping=mapping,
+            bundle_resources={global_pool_id: bundle_resources} if bundle_resources else {},
+            n_gpus_per_node=n_gpus_per_node,
+        )
+        managers.append(manager)
 
-    reward_loop_module.RewardLoopManager._orchrl_original_init_reward_loop_workers = (
-        original_init_reward_loop_workers
-    )
-    reward_loop_module.RewardLoopManager._init_reward_loop_workers = _init_reward_loop_workers
-    reward_loop_module._orchrl_external_mas_reward_loop_patched = True
+    return managers
 
 
 def _expand_single_base_model_role_specific(

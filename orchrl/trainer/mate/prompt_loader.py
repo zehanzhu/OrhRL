@@ -1,25 +1,60 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Any
 
 
 class MatePromptLoader:
-    def __init__(self, source_type: str, path: str | Path, prompt_keys: list[str], expected_keys: list[str] | None = None):
+    def __init__(
+        self,
+        source_type: str,
+        path: str | Path,
+        prompt_keys: list[str],
+        expected_keys: list[str] | None = None,
+        *,
+        repeat: bool = False,
+        shuffle: bool = False,
+        seed: int = 0,
+    ):
         if not prompt_keys:
             raise ValueError("prompt_keys must be a non-empty list")
         self._rows = self._load_rows(source_type=source_type, path=path)
         self._prompt_keys = prompt_keys
         self._expected_keys = expected_keys or []
+        self._repeat = bool(repeat)
+        self._shuffle = bool(shuffle)
+        self._seed = int(seed)
+        self._rng = random.Random(self._seed)
+        self._indices = list(range(len(self._rows)))
+        self._cursor = 0
+        if self._shuffle:
+            self._rng.shuffle(self._indices)
 
     def __len__(self) -> int:
         return len(self._rows)
 
     def get_step_batch(self, step_idx: int, batch_size: int) -> list[dict[str, Any]]:
-        start = step_idx * batch_size
-        rows = self._rows[start:start + batch_size]
-        return [self._normalize_row(row) for row in rows]
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if not self._rows:
+            return []
+
+        selected_rows = []
+        while len(selected_rows) < batch_size:
+            if self._cursor >= len(self._indices):
+                if not self._repeat:
+                    break
+                self._cursor = 0
+                if self._shuffle:
+                    self._rng.shuffle(self._indices)
+
+            row = self._rows[self._indices[self._cursor]]
+            selected_rows.append(self._normalize_row(row))
+            self._cursor += 1
+
+        return selected_rows
 
     def iter_batches(self, batch_size: int):
         if batch_size < 1:

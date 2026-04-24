@@ -21,6 +21,7 @@ from orchrl.trainer.validation_runner import ValidationRunner
 from orchrl.utils.clean_up import cleanup_old_image_folders, run_async_cleanup
 from orchrl.utils.performance import simple_timer, colorful_print
 
+
 class MultiAgentsPPOTrainer:
     def __init__(
         self,
@@ -202,25 +203,47 @@ class MultiAgentsPPOTrainer:
     def init_workers(self):
         self.policy_trainer_registry.init_workers()
 
+    @staticmethod
+    def _build_tracking_config(config):
+        tracking_config = OmegaConf.to_container(config, resolve=True)
+        if not isinstance(tracking_config, dict):
+            return tracking_config
+
+        trainer_cfg = tracking_config.get("trainer")
+        if not isinstance(trainer_cfg, dict):
+            tracking_config["trainer"] = {}
+        return tracking_config
+
     def _initialize_logger_safely(self):
         from verl.utils.tracking import Tracking
         from datetime import datetime
         import os
+        from pathlib import Path
 
-        # Generate log path: outputs/logs/experiment_name/date/time
+        # Resolve logger output against the configured run directory so Ray remote
+        # tasks do not depend on their process working directory.
         current_time = datetime.now()
         date_str = current_time.strftime("%m-%d")
         time_str = current_time.strftime("%H-%M-%S")
 
         experiment_name = self.config.training.experiment_name
-        log_dir = os.path.join("outputs", "logs", experiment_name, date_str, time_str)
+        run_dir = getattr(self.config.training, "run_dir", None)
+        if run_dir:
+            run_dir_path = Path(str(run_dir)).expanduser()
+            if not run_dir_path.is_absolute():
+                run_dir_path = Path.cwd() / run_dir_path
+            log_dir = run_dir_path / "logs" / date_str / time_str
+        else:
+            log_dir = (Path.cwd() / "outputs" / "logs" / experiment_name / date_str / time_str)
+
+        log_dir = log_dir.resolve()
         os.makedirs(log_dir, exist_ok=True)
 
         logger = Tracking(
             project_name=self.config.training.project_name,
             experiment_name=experiment_name,
             default_backend=self.config.training.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
+            config=self._build_tracking_config(self.config),
         )
 
         colorful_print(f"Logger initialized with log_dir: {log_dir}", "cyan")

@@ -166,6 +166,7 @@ class MateRuntime:
             host=str(monitor_pool_cfg["host"]),
             base_port=int(monitor_pool_cfg["base_port"]),
             acquire_timeout_sec=float(monitor_pool_cfg["acquire_timeout_sec"]),
+            actor_resources=dict(monitor_pool_cfg.get("actor_resources", {})),
             renderer=renderer_mapping or None,
         )
 
@@ -175,10 +176,16 @@ class MateRuntime:
         self.mate_train_prompt_loader = self._build_mate_prompt_loader(
             prompt_loader_cfg=prompt_loader_cfg,
             data_path=self.config.training.train_data_path,
+            repeat=bool(prompt_loader_cfg.get("train_repeat", True)),
+            shuffle=bool(prompt_loader_cfg.get("train_shuffle", True)),
+            seed=int(prompt_loader_cfg.get("train_seed", 0)),
         )
         self.mate_val_prompt_loader = self._build_mate_prompt_loader(
             prompt_loader_cfg=prompt_loader_cfg,
             data_path=self.config.training.val_data_path,
+            repeat=False,
+            shuffle=False,
+            seed=0,
         )
         self.mate_reward_provider = build_reward_provider(reward_cfg)
         self.mate_rollout_adapter = MateRolloutAdapter(
@@ -201,7 +208,15 @@ class MateRuntime:
             monitor_pool_manager=self.monitor_pool_manager,
         )
 
-    def _build_mate_prompt_loader(self, *, prompt_loader_cfg, data_path):
+    def _build_mate_prompt_loader(
+        self,
+        *,
+        prompt_loader_cfg,
+        data_path,
+        repeat: bool,
+        shuffle: bool,
+        seed: int,
+    ):
         return MatePromptLoader(
             source_type=prompt_loader_cfg.get(
                 "source_type",
@@ -210,4 +225,7 @@ class MateRuntime:
             path=str(data_path),
             prompt_keys=list(prompt_loader_cfg["prompt_keys"]),
             expected_keys=list(prompt_loader_cfg.get("expected_keys", [])),
+            repeat=repeat,
+            shuffle=shuffle,
+            seed=seed,
         )

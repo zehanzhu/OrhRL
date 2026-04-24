@@ -9,8 +9,10 @@ import yaml
 
 from orchrl.agent_trajectory_engine import (
     AgentPipeConfig,
+    MateCollectedRollouts,
     ModelMappingEntry,
     MonitorPoolManager,
+    RolloutFailure,
     TreeEpisodeResult,
     parallel_rollout,
     tree_rollout,
@@ -69,7 +71,12 @@ class MateRolloutAdapter:
 
     async def collect_prompt_batch_rollouts(self, prompts, *, n_samples_per_prompt: int | None = None):
         if not prompts:
-            return []
+            return MateCollectedRollouts(
+                episodes=[],
+                expected_job_count=0,
+                success_count=0,
+                failed_count=0,
+            )
 
         sample_count = self._n_samples_per_prompt if n_samples_per_prompt is None else int(n_samples_per_prompt)
         pipe_config = self._build_pipe_config()
@@ -90,11 +97,40 @@ class MateRolloutAdapter:
             async with semaphore:
                 return await self._collect_single_job(job=job, pipe_config=pipe_config)
 
-        gathered = await asyncio.gather(*(run_job(job) for job in jobs))
+        gathered = await asyncio.gather(
+            *(run_job(job) for job in jobs),
+            return_exceptions=True,
+        )
         episodes = []
-        for results in gathered:
-            episodes.extend(results)
-        return episodes
+        expected_job_count = 0
+        success_count = 0
+        failed_count = 0
+        failures = []
+        for item in gathered:
+            if isinstance(item, Exception):
+                failures.append(
+                    RolloutFailure(
+                        error_type=type(item).__name__,
+                        message=str(item),
+                    )
+                )
+                expected_job_count += 1
+                failed_count += 1
+                continue
+            if isinstance(item, BaseException):
+                raise item
+            episodes.extend(list(getattr(item, "episodes", []) or []))
+            expected_job_count += int(getattr(item, "expected_job_count", 0))
+            success_count += int(getattr(item, "success_count", 0))
+            failed_count += int(getattr(item, "failed_count", 0))
+            failures.extend(list(getattr(item, "failures", []) or []))
+        return MateCollectedRollouts(
+            episodes=episodes,
+            expected_job_count=expected_job_count,
+            success_count=success_count,
+            failed_count=failed_count,
+            failures=failures,
+        )
 
     async def _collect_single_job(self, *, job, pipe_config: AgentPipeConfig):
         job_metadata = {
@@ -106,16 +142,66 @@ class MateRolloutAdapter:
         }
         reward_provider = _JobAwareRewardProvider(self._reward_provider, job_metadata)
         if self._rollout_mode == "tree":
-            result = await tree_rollout(
-                prompt=job["prompt_item"]["prompt"],
-                reward_provider=reward_provider,
-                config=pipe_config,
-                k_branches=self._k_branches,
-                max_concurrent_branches=self._max_concurrent_branches,
-                monitor_pool_manager=self._monitor_pool_manager,
-            )
+            try:
+                result = await tree_rollout(
+                    prompt=job["prompt_item"]["prompt"],
+                    reward_provider=reward_provider,
+                    config=pipe_config,
+                    k_branches=self._k_branches,
+                    max_concurrent_branches=self._max_concurrent_branches,
+                    monitor_pool_manager=self._monitor_pool_manager,
+                )
+            except Exception as exc:
+                return MateCollectedRollouts(
+                    episodes=[],
+                    expected_job_count=1,
+                    success_count=0,
+                    failed_count=1,
+                    failures=[
+                        RolloutFailure(
+                            error_type=type(exc).__name__,
+                            message=str(exc),
+                            prompt=job_metadata["prompt"],
+                            sample_idx=job_metadata["sample_idx"],
+                            metadata={"prompt_group_id": job_metadata["prompt_group_id"]},
+                        )
+                    ],
+                )
             self._annotate_tree_result(result, job_metadata)
-            return [result]
+            if result.pilot_result.status != "success":
+                return MateCollectedRollouts(
+                    episodes=[],
+                    expected_job_count=1,
+                    success_count=0,
+                    failed_count=1,
+                    failures=[
+                        RolloutFailure(
+                            error_type="TreePilotFailed",
+                            message=str(result.pilot_result.failure_info or "tree pilot failed"),
+                            prompt=job_metadata["prompt"],
+                            sample_idx=job_metadata["sample_idx"],
+                            metadata={"prompt_group_id": job_metadata["prompt_group_id"]},
+                        )
+                    ],
+                )
+            expected_branch_count = int(result.tree_metadata.get("expected_branch_count", 0))
+            failed_branch_count = int(result.tree_metadata.get("failed_branch_count", 0))
+            return MateCollectedRollouts(
+                episodes=[result],
+                expected_job_count=1 + expected_branch_count,
+                success_count=1 + len(result.branch_results),
+                failed_count=failed_branch_count,
+                failures=[
+                    RolloutFailure(
+                        error_type="TreeBranchFailed",
+                        message="tree branch rollout failed",
+                        prompt=job_metadata["prompt"],
+                        sample_idx=job_metadata["sample_idx"],
+                        metadata={"prompt_group_id": job_metadata["prompt_group_id"]},
+                    )
+                    for _ in range(failed_branch_count)
+                ],
+            )
 
         results = await parallel_rollout(
             prompts=[job["prompt_item"]["prompt"]],
@@ -125,10 +211,22 @@ class MateRolloutAdapter:
             max_concurrent=None,
             monitor_pool_manager=self._monitor_pool_manager,
         )
-        for result in results:
+        for result in results.episodes:
             result.metadata.update(job_metadata)
             result.trajectory.metadata.update(job_metadata)
-        return results
+        return MateCollectedRollouts(
+            episodes=list(results.episodes),
+            expected_job_count=results.expected_job_count,
+            success_count=results.success_count,
+            failed_count=results.failed_count,
+            failures=[
+                self._annotate_failure(
+                    failure,
+                    metadata=job_metadata,
+                )
+                for failure in results.failures
+            ],
+        )
 
     def _build_pipe_config(self) -> AgentPipeConfig:
         model_mapping: dict[str, ModelMappingEntry] = {}
@@ -145,6 +243,7 @@ class MateRolloutAdapter:
             model_mapping=model_mapping,
             timeout=float(self._config.get("timeout", 300.0)),
             mas_work_dir=Path(self._config["mas_work_dir"]) if self._config.get("mas_work_dir") else None,
+            mas_log_dir=Path(self._config["mas_log_dir"]) if self._config.get("mas_log_dir") else None,
         )
 
     def _load_config_template(self) -> dict[str, Any]:
@@ -199,3 +298,28 @@ class MateRolloutAdapter:
         annotate_episode(result.pilot_result)
         for branch in result.branch_results:
             annotate_episode(branch.episode_result)
+
+    @staticmethod
+    def _annotate_failure(failure, *, metadata: dict[str, Any]):
+        if isinstance(failure, RolloutFailure):
+            failure.prompt = metadata["prompt"]
+            failure.sample_idx = metadata["sample_idx"]
+            failure.metadata.update({"prompt_group_id": metadata["prompt_group_id"]})
+            return failure
+        if isinstance(failure, dict):
+            merged_metadata = dict(failure.get("metadata") or {})
+            merged_metadata.update({"prompt_group_id": metadata["prompt_group_id"]})
+            return RolloutFailure(
+                error_type=str(failure.get("error_type", "RuntimeError")),
+                message=str(failure.get("message", "")),
+                prompt=metadata["prompt"],
+                sample_idx=metadata["sample_idx"],
+                metadata=merged_metadata,
+            )
+        return RolloutFailure(
+            error_type=type(failure).__name__,
+            message=str(failure),
+            prompt=metadata["prompt"],
+            sample_idx=metadata["sample_idx"],
+            metadata={"prompt_group_id": metadata["prompt_group_id"]},
+        )

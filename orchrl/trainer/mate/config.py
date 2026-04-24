@@ -10,6 +10,12 @@ _DEFAULT_MONITOR_POOL = {
     "host": "127.0.0.1",
     "base_port": 19000,
     "acquire_timeout_sec": 300.0,
+    "actor_resources": {},
+}
+
+_DEFAULT_FAILURE_POLICY = {
+    "mode": "threshold",
+    "max_failed_rate": 0.8,
 }
 
 
@@ -53,11 +59,39 @@ def _normalize_monitor_pool_config(raw_monitor_pool: Any) -> dict[str, Any]:
     if acquire_timeout_sec <= 0:
         raise ValueError("mate.monitor_pool.acquire_timeout_sec must be > 0")
 
+    actor_resources = merged.get("actor_resources", {})
+    if actor_resources is None:
+        actor_resources = {}
+    if not isinstance(actor_resources, Mapping):
+        raise ValueError("mate.monitor_pool.actor_resources must be a dict when provided")
+
     return {
         "size": size,
         "host": host,
         "base_port": base_port,
         "acquire_timeout_sec": acquire_timeout_sec,
+        "actor_resources": dict(actor_resources),
+    }
+
+
+def _normalize_failure_policy_config(raw_failure_policy: Any) -> dict[str, Any]:
+    failure_policy = dict(_DEFAULT_FAILURE_POLICY)
+    if raw_failure_policy is not None:
+        if not isinstance(raw_failure_policy, Mapping):
+            raise TypeError("mate.failure_policy must be a dict when provided")
+        failure_policy.update(dict(raw_failure_policy))
+
+    mode = str(failure_policy.get("mode", "threshold"))
+    if mode not in {"warn", "threshold", "error"}:
+        raise ValueError("mate.failure_policy.mode must be one of warn/threshold/error")
+
+    max_failed_rate = float(failure_policy.get("max_failed_rate", 0.8))
+    if max_failed_rate < 0:
+        raise ValueError("mate.failure_policy.max_failed_rate must be >= 0")
+
+    return {
+        "mode": mode,
+        "max_failed_rate": max_failed_rate,
     }
 
 
@@ -97,4 +131,7 @@ def validate_mate_config(mate_cfg: Any, agent_policy_mapping: Mapping[str, str] 
 
     config_dict["rollout_mode"] = rollout_mode
     config_dict["monitor_pool"] = _normalize_monitor_pool_config(config_dict.get("monitor_pool"))
+    config_dict["failure_policy"] = _normalize_failure_policy_config(
+        config_dict.get("failure_policy")
+    )
     return config_dict

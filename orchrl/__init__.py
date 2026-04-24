@@ -1,5 +1,6 @@
 # Monkey patch a few functions to avoid name collision with multi trainers. In the long run, these changes should be merged to verl.
 
+from orchrl.verl_resource_pool_patch import patch_verl_resource_pool_manager
 from packaging import version
 from verl.workers.rollout.vllm_rollout.vllm_async_server import _VLLM_VERSION, vLLMReplica
 from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter
@@ -8,6 +9,8 @@ import asyncio
 import ray
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.utils.device import get_resource_name
+
+patch_verl_resource_pool_manager()
 
 
 async def launch_servers(self):
@@ -59,8 +62,16 @@ async def launch_servers(self):
                 node_id=node_id,
                 soft=False,
             ),
-            runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
+            runtime_env={
+                "env_vars": {
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                    "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                    # Keep parity with upstream VERL's vLLM server actor environment.
+                    "NCCL_CUMEM_ENABLE": "0",
+                }
+            },
             name=name,
+            max_concurrency=self.max_concurrency,
         ).remote(
             config=self.config,
             model_config=self.model_config,

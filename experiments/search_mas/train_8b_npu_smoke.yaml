@@ -1,0 +1,103 @@
+defaults:
+- train
+- _self_
+
+resource:
+  n_gpus_per_node: 12
+
+base_models:
+  policy_0:
+    path: /mnt/bn/chenghao-1026-hl/resources/models/Qwen3-8B
+  policy_1:
+    path: /mnt/bn/chenghao-1026-hl/resources/models/Qwen3-8B
+  policy_2:
+    path: /mnt/bn/chenghao-1026-hl/resources/models/Qwen3-8B
+
+training:
+  device: npu
+  total_training_steps: 1
+  train_batch_size: 1
+  validate_batch_size: 2
+  val_freq: 1000
+  experiment_name: search_mas_8b_npu_smoke
+  data_root_dir: /mnt/bn/chenghao-1026-hl/zehan/datasets/drmas_search_mas
+  max_prompt_length: 1024
+  max_response_length: 512
+  mate:
+    batch_size: ${training.train_batch_size}
+    n_samples_per_prompt: 1
+    max_concurrent_episodes: 1
+    timeout: 180
+    backend_timeout: 180
+    mas_work_dir: /opt/tiger/bi_verl/OrhRL/mas_apps/search
+    config_template_path: /opt/tiger/bi_verl/OrhRL/mas_apps/search/configs/inference.yaml
+    monitor_pool:
+      size: 2
+
+models:
+  model_0:
+    ppo_trainer_config:
+      trainer:
+        device: npu
+        n_gpus_per_node: 4
+        n_training_gpus_per_node: 4
+        total_training_steps: 1
+        save_freq: -1
+        test_freq: -1
+      actor_rollout_ref:
+        actor:
+          ppo_max_token_len_per_gpu: 1536
+        ref:
+          log_prob_max_token_len_per_gpu: 1536
+        rollout:
+          prompt_length: ${training.max_prompt_length}
+          response_length: ${training.max_response_length}
+          max_model_len: 1536
+          max_num_batched_tokens: 1024
+          max_num_seqs: 2
+          log_prob_max_token_len_per_gpu: 1536
+          gpu_memory_utilization: 0.45
+  model_1:
+    ppo_trainer_config:
+      trainer:
+        device: npu
+        n_gpus_per_node: 4
+        n_training_gpus_per_node: 4
+        total_training_steps: 1
+        save_freq: -1
+        test_freq: -1
+      actor_rollout_ref:
+        actor:
+          ppo_max_token_len_per_gpu: 1536
+        ref:
+          log_prob_max_token_len_per_gpu: 1536
+        rollout:
+          prompt_length: ${training.max_prompt_length}
+          response_length: ${training.max_response_length}
+          max_model_len: 1536
+          max_num_batched_tokens: 1024
+          max_num_seqs: 2
+          log_prob_max_token_len_per_gpu: 1536
+          gpu_memory_utilization: 0.45
+  model_2:
+    ppo_trainer_config:
+      trainer:
+        device: npu
+        n_gpus_per_node: 4
+        n_training_gpus_per_node: 4
+        total_training_steps: 1
+        save_freq: -1
+        test_freq: -1
+      actor_rollout_ref:
+        actor:
+          ppo_max_token_len_per_gpu: 1536
+        ref:
+          log_prob_max_token_len_per_gpu: 1536
+        rollout:
+          prompt_length: ${training.max_prompt_length}
+          response_length: ${training.max_response_length}
+          max_model_len: 1536
+          max_num_batched_tokens: 1024
+          max_num_seqs: 2
+          log_prob_max_token_len_per_gpu: 1536
+          gpu_memory_utilization: 0.45

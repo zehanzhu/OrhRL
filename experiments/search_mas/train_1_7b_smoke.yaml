@@ -1,0 +1,56 @@
+defaults:
+- train
+- _self_
+
+resource:
+  n_gpus_per_node: 3
+
+base_models:
+  policy_0:
+    path: /mnt/bn/chenghao1026/models/Qwen3-1.7B
+  policy_1:
+    path: /mnt/bn/chenghao1026/models/Qwen3-1.7B
+  policy_2:
+    path: /mnt/bn/chenghao1026/models/Qwen3-1.7B
+
+training:
+  total_training_steps: 3
+  train_batch_size: 1
+  validate_batch_size: 2
+  val_freq: 1000
+  experiment_name: search_mas_1_7b_smoke
+  mate:
+    batch_size: ${training.train_batch_size}
+    n_samples_per_prompt: 1
+    max_concurrent_episodes: 2
+    monitor_pool:
+      size: 2
+
+models:
+  model_0:
+    ppo_trainer_config:
+      actor_rollout_ref:
+        rollout:
+          max_num_seqs: 2
+          tensor_model_parallel_size: 1
+        trainer:
+          n_gpus_per_node: 1
+          n_training_gpus_per_node: 1
+  model_1:
+    ppo_trainer_config:
+      actor_rollout_ref:
+        rollout:
+          max_num_seqs: 2
+          tensor_model_parallel_size: 1
+        trainer:
+          n_gpus_per_node: 1
+          n_training_gpus_per_node: 1
+  model_2:
+    ppo_trainer_config:
+      actor_rollout_ref:
+        rollout:
+          max_num_seqs: 2
+          tensor_model_parallel_size: 1
+        trainer:
+          n_gpus_per_node: 1
+          n_training_gpus_per_node: 1

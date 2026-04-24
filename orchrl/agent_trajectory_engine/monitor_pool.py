@@ -35,6 +35,7 @@ class MonitorPoolManager:
         host: str = "127.0.0.1",
         base_port: int = 19000,
         acquire_timeout_sec: float = 300.0,
+        actor_resources: dict[str, float] | None = None,
         renderer: ChatRenderer | dict[str, ChatRenderer] | None = None,
     ) -> None:
         if size < 1:
@@ -50,6 +51,7 @@ class MonitorPoolManager:
         self._host = host
         self._base_port = base_port
         self._acquire_timeout_sec = acquire_timeout_sec
+        self._actor_resources = dict(actor_resources or {})
         self._renderer = renderer
 
         self._actors: dict[int, Any] = {}
@@ -161,7 +163,8 @@ class MonitorPoolManager:
             return actor
 
     def _create_actor(self, actor_index: int):
-        actor = MonitorActor.remote(
+        actor_cls = MonitorActor.options(resources=self._actor_resources) if self._actor_resources else MonitorActor
+        actor = actor_cls.remote(
             backend=self._backend,
             model_mapping=self._model_mapping,
             host=self._host,

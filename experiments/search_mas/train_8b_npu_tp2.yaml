@@ -1,0 +1,84 @@
+defaults:
+- train
+- _self_
+
+resource:
+  n_gpus_per_node: 6
+
+base_models:
+  policy_0:
+    path: /mnt/bn/chenghao-1026-hl/resources/models/Qwen3-8B
+  policy_1:
+    path: /mnt/bn/chenghao-1026-hl/resources/models/Qwen3-8B
+  policy_2:
+    path: /mnt/bn/chenghao-1026-hl/resources/models/Qwen3-8B
+
+training:
+  device: npu
+  total_training_steps: 1
+  experiment_name: search_mas_8b_npu_tp2
+  data_root_dir: /mnt/bn/chenghao-1026-hl/zehan/datasets/drmas_search_mas
+  train_data_path: ${training.data_root_dir}/train.parquet
+  val_data_path: ${training.data_root_dir}/test_sampled.parquet
+  mate:
+    mas_work_dir: /opt/tiger/bi_verl/OrhRL/mas_apps/search
+    config_template_path: /opt/tiger/bi_verl/OrhRL/mas_apps/search/configs/inference.yaml
+
+models:
+  model_0:
+    ppo_trainer_config:
+      trainer:
+        device: npu
+        n_gpus_per_node: 2
+        n_training_gpus_per_node: 2
+        total_training_steps: 1
+        save_freq: -1
+        test_freq: -1
+      actor_rollout_ref:
+        actor:
+          fsdp_config:
+            param_offload: true
+            optimizer_offload: true
+        ref:
+          fsdp_config:
+            param_offload: true
+        rollout:
+          tensor_model_parallel_size: 2
+  model_1:
+    ppo_trainer_config:
+      trainer:
+        device: npu
+        n_gpus_per_node: 2
+        n_training_gpus_per_node: 2
+        total_training_steps: 1
+        save_freq: -1
+        test_freq: -1
+      actor_rollout_ref:
+        actor:
+          fsdp_config:
+            param_offload: true
+            optimizer_offload: true
+        ref:
+          fsdp_config:
+            param_offload: true
+        rollout:
+          tensor_model_parallel_size: 2
+  model_2:
+    ppo_trainer_config:
+      trainer:
+        device: npu
+        n_gpus_per_node: 2
+        n_training_gpus_per_node: 2
+        total_training_steps: 1
+        save_freq: -1
+        test_freq: -1
+      actor_rollout_ref:
+        actor:
+          fsdp_config:
+            param_offload: true
+            optimizer_offload: true
+        ref:
+          fsdp_config:
+            param_offload: true
+        rollout:
+          tensor_model_parallel_size: 2
