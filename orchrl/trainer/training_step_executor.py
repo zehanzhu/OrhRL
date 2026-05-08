@@ -106,11 +106,7 @@ class TrainingStepExecutor:
         if max_response_length is None:
             max_response_length = next(iter(ppo_trainer_dict.values())).config.data.max_response_length
 
-        role_names = (
-            list(self.agent_policy_mapping.keys())
-            if self.agent_policy_mapping
-            else list(self.mate_runtime.mate_config["role_policy_mapping"].keys())
-        )
+        role_names = list(self.mate_runtime.mate_config["role_policy_mapping"].keys())
         adapter_fn = (
             tree_episodes_to_decision_point_batches
             if self.mate_rollout_mode() == "tree"

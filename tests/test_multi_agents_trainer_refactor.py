@@ -1,7 +1,8 @@
 from pathlib import Path
 from contextlib import ExitStack
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import asyncio
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -301,6 +302,126 @@ class PolicyTrainerRegistryBehaviorTests(unittest.TestCase):
 
 
 class TrainConfigNormalizationTests(unittest.TestCase):
+    def _patch_fake_megatron_worker_module(self):
+        fake_module = ModuleType("orchrl.workers.megatron_workers")
+        fake_module.AsyncActorRolloutRefWorker = type(
+            "FakeMegatronAsyncActorRolloutRefWorker",
+            (),
+            {},
+        )
+        fake_module.CriticWorker = type(
+            "FakeMegatronCriticWorker",
+            (),
+            {},
+        )
+        return mock.patch.dict(
+            sys.modules,
+            {"orchrl.workers.megatron_workers": fake_module},
+        )
+
+    def test_normalize_megatron_router_replay_copies_engine_setting_to_actor_root(self):
+        from orchrl.trainer.train import _normalize_megatron_router_replay_config
+
+        config = OmegaConf.create(
+            {
+                "models": {
+                    "model_0": {
+                        "ppo_trainer_config": {
+                            "actor_rollout_ref": {
+                                "actor": {
+                                    "strategy": "megatron",
+                                    "megatron": {
+                                        "router_replay": {
+                                            "mode": "R2",
+                                            "record_file": "/tmp/router.jsonl",
+                                            "replay_file": None,
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+        _normalize_megatron_router_replay_config(config)
+
+        actor_cfg = config.models.model_0.ppo_trainer_config.actor_rollout_ref.actor
+        self.assertEqual(actor_cfg.router_replay.mode, "R2")
+        self.assertEqual(actor_cfg.router_replay.record_file, "/tmp/router.jsonl")
+
+    def test_normalize_megatron_router_replay_preserves_existing_actor_root_setting(self):
+        from orchrl.trainer.train import _normalize_megatron_router_replay_config
+
+        config = OmegaConf.create(
+            {
+                "models": {
+                    "model_0": {
+                        "ppo_trainer_config": {
+                            "actor_rollout_ref": {
+                                "actor": {
+                                    "strategy": "megatron",
+                                    "router_replay": {"mode": "disabled"},
+                                    "megatron": {
+                                        "router_replay": {
+                                            "mode": "R3",
+                                            "record_file": None,
+                                            "replay_file": "/tmp/router.jsonl",
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+        _normalize_megatron_router_replay_config(config)
+
+        actor_cfg = config.models.model_0.ppo_trainer_config.actor_rollout_ref.actor
+        self.assertEqual(actor_cfg.router_replay.mode, "disabled")
+
+    def test_normalize_megatron_config_strips_fsdp_only_fields_from_smoke_config(self):
+        from hydra import compose, initialize_config_dir
+        from orchrl.trainer.train import _normalize_megatron_train_configs
+
+        config_dir = str(
+            Path(__file__).resolve().parents[1] / "experiments" / "search_mas"
+        )
+        with initialize_config_dir(version_base=None, config_dir=config_dir):
+            config = compose(config_name="train_megatron_moe_smoke")
+
+        _normalize_megatron_train_configs(config)
+
+        actor_cfg = config.models.model_0.ppo_trainer_config.actor_rollout_ref.actor
+        actor_optim_cfg = actor_cfg.optim
+        ref_cfg = config.models.model_0.ppo_trainer_config.actor_rollout_ref.ref
+        rollout_cfg = config.models.model_0.ppo_trainer_config.actor_rollout_ref.rollout
+
+        self.assertNotIn("fsdp_config", actor_cfg)
+        self.assertNotIn("grad_clip", actor_cfg)
+        self.assertNotIn("ulysses_sequence_parallel_size", actor_cfg)
+
+        self.assertNotIn("optimizer_impl", actor_optim_cfg)
+        self.assertNotIn("min_lr_ratio", actor_optim_cfg)
+        self.assertNotIn("num_cycles", actor_optim_cfg)
+        self.assertNotIn("warmup_style", actor_optim_cfg)
+
+        self.assertNotIn("fsdp_config", ref_cfg)
+        self.assertNotIn("ulysses_sequence_parallel_size", ref_cfg)
+        self.assertEqual(ref_cfg.log_prob_micro_batch_size_per_gpu, 1)
+        self.assertEqual(ref_cfg.log_prob_max_token_len_per_gpu, 4096)
+        self.assertFalse(ref_cfg.log_prob_use_dynamic_bsz)
+        self.assertEqual(rollout_cfg.log_prob_micro_batch_size_per_gpu, 1)
+        self.assertFalse(rollout_cfg.log_prob_use_dynamic_bsz)
+        self.assertEqual(rollout_cfg.log_prob_max_token_len_per_gpu, 4096)
+        self.assertIn("mtp", config.models.model_0.ppo_trainer_config.actor_rollout_ref.model)
+        self.assertFalse(
+            config.models.model_0.ppo_trainer_config.actor_rollout_ref.model.mtp.enable
+        )
+
     def test_role_specific_topology_rejects_duplicate_resolved_served_model_names(self):
         from orchrl.trainer.train import _validate_unique_role_specific_served_model_names
 
@@ -490,9 +611,17 @@ class TrainConfigNormalizationTests(unittest.TestCase):
         fake_remote_worker = object()
 
         class _FakeResourcePoolManager:
-            def __init__(self, resource_pool_spec, mapping):
+            def __init__(
+                self,
+                resource_pool_spec,
+                mapping,
+                bundle_resources=None,
+                n_gpus_per_node=None,
+            ):
                 self.resource_pool_spec = resource_pool_spec
                 self.mapping = mapping
+                self.bundle_resources = bundle_resources or {}
+                self.n_gpus_per_node = n_gpus_per_node
 
             def create_resource_pool(self):
                 return None
@@ -571,6 +700,114 @@ class TrainConfigNormalizationTests(unittest.TestCase):
             train_module.train_multi_agents(config)
 
         self.assertEqual(call_count["expand"], 0)
+
+    def test_train_multi_agents_uses_megatron_actor_rollout_role_for_grpo(self):
+        from orchrl.trainer import train as train_module
+        from verl.trainer.ppo.ray_trainer import Role
+
+        config = OmegaConf.create(
+            {
+                "specialization": "role_sharing",
+                "resource": {"n_gpus_per_node": 1, "nnodes": 1},
+                "training": {"train_batch_size": 2},
+                "agent_policy_configs": {
+                    "agent_configs": {
+                        "agent_0": {"name": "verifier", "policy_name": "policy_a"}
+                    }
+                },
+                "base_models": {
+                    "policy_0": {"path": "/models/base", "name": "policy_a"}
+                },
+                "models": {
+                    "model_0": {
+                        "path": "/models/base",
+                        "name": "policy_a",
+                        "ppo_trainer_config": {
+                            "actor_rollout_ref": {
+                                "actor": {"strategy": "megatron", "use_kl_loss": False},
+                                "ref": {},
+                                "rollout": {},
+                                "model": {"path": "/models/base"},
+                            },
+                            "critic": {"enable": False},
+                            "algorithm": {"use_kl_in_reward": False},
+                        },
+                    }
+                },
+            }
+        )
+
+        captured = {}
+
+        class _FakeTrainer:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def init_workers(self):
+                return None
+
+            def init_mate_rollout_runtime(self):
+                return None
+
+            def fit(self):
+                return None
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(train_module, "_patch_verl_reward_loop_for_external_mas")
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    train_module, "_validate_unique_role_specific_served_model_names"
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    train_module,
+                    "_build_policy_resource_pool_managers",
+                    return_value=["pool-0"],
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    train_module,
+                    "_build_role_worker_mapping",
+                    return_value=({Role.ActorRollout: "megatron-worker"}, Role.ActorRollout),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(train_module, "MultiAgentsPPOTrainer", _FakeTrainer)
+            )
+            stack.enter_context(
+                mock.patch(
+                    "orchrl.trainer.train.copy_local_path_from_hdfs",
+                    side_effect=lambda path: path,
+                    create=True,
+                )
+            )
+            stack.enter_context(
+                mock.patch(
+                    "verl.utils.fs.copy_local_path_from_hdfs",
+                    side_effect=lambda path: path,
+                )
+            )
+            stack.enter_context(
+                mock.patch(
+                    "verl.utils.hf_tokenizer",
+                    side_effect=lambda path, trust_remote_code=False: f"tok::{path}",
+                )
+            )
+            stack.enter_context(
+                mock.patch(
+                    "orchrl.trainer.train.hf_tokenizer",
+                    side_effect=lambda path, trust_remote_code=False: f"tok::{path}",
+                    create=True,
+                )
+            )
+
+            train_module.train_multi_agents(config)
+
+        self.assertEqual(captured["role_worker_mapping"], {Role.ActorRollout: "megatron-worker"})
 
     def test_run_ppo_uses_remote_worker_by_default(self):
         from orchrl.trainer import train as train_module
@@ -693,6 +930,447 @@ class TrainConfigNormalizationTests(unittest.TestCase):
         self.assertEqual(trainer.tokenizer_dict, {"policy_a": "tok-a"})
         self.assertEqual(trainer.server_handle_dict, {"policy_a": ["h-a"]})
         self.assertEqual(trainer.policy_server_name_mapping, {"policy_a": "served-a"})
+
+    def test_select_policy_worker_backend_uses_fsdp_actor_rollout_ref_role(self):
+        from orchrl.trainer import train as train_module
+        from verl.trainer.ppo.ray_trainer import Role
+
+        config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "actor": {"strategy": "fsdp"},
+                    "model": {},
+                    "ref": {},
+                    "rollout": {},
+                },
+                "algorithm": {
+                    "use_kl_in_reward": False,
+                },
+            }
+        )
+
+        with mock.patch.object(
+            train_module,
+            "_ray_remote_actor_worker",
+            return_value="fsdp-worker",
+            create=True,
+        ):
+            role_worker_mapping, actor_role = train_module._build_role_worker_mapping(config)
+
+        self.assertEqual(actor_role, Role.ActorRolloutRef)
+        self.assertEqual(role_worker_mapping[Role.ActorRolloutRef], "fsdp-worker")
+
+    def test_select_policy_worker_backend_uses_megatron_actor_rollout_role(self):
+        from orchrl.trainer import train as train_module
+        from verl.trainer.ppo.ray_trainer import Role
+
+        config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "actor": {"strategy": "megatron"},
+                    "model": {},
+                    "ref": {},
+                    "rollout": {},
+                },
+                "algorithm": {
+                    "use_kl_in_reward": False,
+                },
+            }
+        )
+
+        with self._patch_fake_megatron_worker_module():
+            with mock.patch.object(
+                train_module,
+                "_ray_remote_actor_worker",
+                return_value="megatron-worker",
+                create=True,
+            ):
+                role_worker_mapping, actor_role = train_module._build_role_worker_mapping(config)
+
+        self.assertEqual(actor_role, Role.ActorRollout)
+        self.assertEqual(role_worker_mapping[Role.ActorRollout], "megatron-worker")
+
+    def test_select_policy_worker_backend_reads_megatron_from_policy_ppo_config(self):
+        from orchrl.trainer import train as train_module
+        from verl.trainer.ppo.ray_trainer import Role
+
+        config = OmegaConf.create(
+            {
+                "specialization": "role_sharing",
+                "models": {
+                    "m1": {
+                        "name": "policy_a",
+                        "ppo_trainer_config": {
+                            "actor_rollout_ref": {
+                                "actor": {"strategy": "megatron"},
+                                "model": {},
+                                "ref": {},
+                                "rollout": {},
+                            },
+                            "algorithm": {
+                                "use_kl_in_reward": False,
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        with self._patch_fake_megatron_worker_module():
+            with mock.patch.object(
+                train_module,
+                "_ray_remote_actor_worker",
+                return_value="megatron-worker",
+                create=True,
+            ):
+                role_worker_mapping, actor_role = train_module._build_role_worker_mapping(config)
+
+        self.assertEqual(actor_role, Role.ActorRollout)
+        self.assertEqual(role_worker_mapping[Role.ActorRollout], "megatron-worker")
+
+    def test_build_role_worker_mapping_registers_ref_policy_for_nested_ppo_config(self):
+        from orchrl.trainer import train as train_module
+        from verl.trainer.ppo.ray_trainer import Role
+
+        config = OmegaConf.create(
+            {
+                "specialization": "role_sharing",
+                "models": {
+                    "m1": {
+                        "name": "policy_a",
+                        "ppo_trainer_config": {
+                            "actor_rollout_ref": {
+                                "actor": {
+                                    "strategy": "megatron",
+                                    "use_kl_loss": True,
+                                },
+                                "model": {},
+                                "ref": {},
+                                "rollout": {},
+                            },
+                            "algorithm": {
+                                "use_kl_in_reward": False,
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        with self._patch_fake_megatron_worker_module():
+            with mock.patch.object(
+                train_module,
+                "_ray_remote_actor_worker",
+                return_value="megatron-worker",
+                create=True,
+            ):
+                role_worker_mapping, actor_role = train_module._build_role_worker_mapping(config)
+
+        self.assertEqual(actor_role, Role.ActorRollout)
+        self.assertEqual(role_worker_mapping[Role.ActorRollout], "megatron-worker")
+        self.assertEqual(role_worker_mapping[Role.RefPolicy], "megatron-worker")
+
+    def test_build_role_worker_mapping_rejects_mixed_strategies_across_models(self):
+        from orchrl.trainer import train as train_module
+
+        config = OmegaConf.create(
+            {
+                "specialization": "role_specific",
+                "models": {
+                    "m1": {
+                        "name": "policy_a",
+                        "ppo_trainer_config": {
+                            "actor_rollout_ref": {
+                                "actor": {"strategy": "fsdp"},
+                                "model": {},
+                                "ref": {},
+                                "rollout": {},
+                            },
+                            "algorithm": {
+                                "use_kl_in_reward": False,
+                            },
+                        },
+                    },
+                    "m2": {
+                        "name": "policy_b",
+                        "ppo_trainer_config": {
+                            "actor_rollout_ref": {
+                                "actor": {"strategy": "megatron"},
+                                "model": {},
+                                "ref": {},
+                                "rollout": {},
+                            },
+                            "algorithm": {
+                                "use_kl_in_reward": False,
+                            },
+                        },
+                    },
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "mixed backend"):
+            train_module._build_role_worker_mapping(config)
+
+    def test_build_role_worker_mapping_registers_ref_policy_when_reference_needed(self):
+        from orchrl.trainer import train as train_module
+        from verl.trainer.ppo.ray_trainer import Role
+
+        config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "actor": {
+                        "strategy": "megatron",
+                        "use_kl_loss": True,
+                    },
+                    "model": {},
+                    "ref": {},
+                    "rollout": {},
+                },
+                "algorithm": {
+                    "use_kl_in_reward": False,
+                },
+            }
+        )
+
+        with self._patch_fake_megatron_worker_module():
+            with mock.patch.object(
+                train_module,
+                "_ray_remote_actor_worker",
+                return_value="megatron-worker",
+                create=True,
+            ):
+                role_worker_mapping, actor_role = train_module._build_role_worker_mapping(config)
+
+        self.assertEqual(actor_role, Role.ActorRollout)
+        self.assertEqual(role_worker_mapping[Role.ActorRollout], "megatron-worker")
+        self.assertIn(Role.RefPolicy, role_worker_mapping)
+        self.assertEqual(role_worker_mapping[Role.RefPolicy], "megatron-worker")
+
+    def test_build_role_worker_mapping_skips_ref_policy_for_grpo_without_kl(self):
+        from orchrl.trainer import train as train_module
+        from verl.trainer.ppo.ray_trainer import Role
+
+        config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "actor": {
+                        "strategy": "megatron",
+                        "use_kl_loss": False,
+                    },
+                    "model": {},
+                    "ref": {},
+                    "rollout": {},
+                },
+                "algorithm": {
+                    "use_kl_in_reward": False,
+                },
+            }
+        )
+
+        with self._patch_fake_megatron_worker_module():
+            with mock.patch.object(
+                train_module,
+                "_ray_remote_actor_worker",
+                return_value="megatron-worker",
+                create=True,
+            ):
+                role_worker_mapping, actor_role = train_module._build_role_worker_mapping(config)
+
+        self.assertEqual(actor_role, Role.ActorRollout)
+        self.assertNotIn(Role.RefPolicy, role_worker_mapping)
+
+    def test_build_role_worker_mapping_registers_critic_worker_when_enabled(self):
+        from orchrl.trainer import train as train_module
+        from verl.trainer.ppo.ray_trainer import Role
+
+        config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "actor": {
+                        "strategy": "megatron",
+                        "use_kl_loss": False,
+                    },
+                    "model": {},
+                    "ref": {},
+                    "rollout": {},
+                },
+                "critic": {
+                    "enable": True,
+                    "strategy": "fsdp",
+                },
+                "algorithm": {
+                    "use_kl_in_reward": False,
+                },
+            }
+        )
+
+        with self._patch_fake_megatron_worker_module():
+            with mock.patch.object(
+                train_module,
+                "_ray_remote_actor_worker",
+                return_value="megatron-worker",
+                create=True,
+            ):
+                with mock.patch.object(
+                    train_module,
+                    "_ray_remote_critic_worker",
+                    return_value="critic-worker",
+                    create=True,
+                ):
+                    role_worker_mapping, actor_role = train_module._build_role_worker_mapping(
+                        config
+                    )
+
+        self.assertEqual(actor_role, Role.ActorRollout)
+        self.assertEqual(role_worker_mapping[Role.ActorRollout], "megatron-worker")
+        self.assertEqual(role_worker_mapping[Role.Critic], "critic-worker")
+
+    def test_build_role_worker_mapping_rejects_mixed_critic_strategies_across_models(self):
+        from orchrl.trainer import train as train_module
+
+        config = OmegaConf.create(
+            {
+                "specialization": "role_specific",
+                "models": {
+                    "m1": {
+                        "name": "policy_a",
+                        "ppo_trainer_config": {
+                            "actor_rollout_ref": {
+                                "actor": {"strategy": "megatron"},
+                                "model": {},
+                                "ref": {},
+                                "rollout": {},
+                            },
+                            "critic": {
+                                "enable": True,
+                                "strategy": "fsdp",
+                            },
+                            "algorithm": {
+                                "use_kl_in_reward": False,
+                            },
+                        },
+                    },
+                    "m2": {
+                        "name": "policy_b",
+                        "ppo_trainer_config": {
+                            "actor_rollout_ref": {
+                                "actor": {"strategy": "megatron"},
+                                "model": {},
+                                "ref": {},
+                                "rollout": {},
+                            },
+                            "critic": {
+                                "enable": True,
+                                "strategy": "megatron",
+                            },
+                            "algorithm": {
+                                "use_kl_in_reward": False,
+                            },
+                        },
+                    },
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "mixed critic backend"):
+            train_module._build_role_worker_mapping(config)
+
+    def test_build_policy_resource_pool_managers_uses_megatron_actor_rollout_role(self):
+        from orchrl.trainer.train import _build_policy_resource_pool_managers
+        from verl.trainer.ppo.ray_trainer import Role
+
+        config = OmegaConf.create(
+            {
+                "models": {
+                    "model_0": {
+                        "name": "policy_a",
+                        "ppo_trainer_config": {
+                            "critic": {"enable": False},
+                            "actor_rollout_ref": {
+                                "actor": {"use_kl_loss": False},
+                            },
+                            "algorithm": {"use_kl_in_reward": False},
+                        },
+                    }
+                },
+                "resource": {
+                    "n_gpus_per_node": 8,
+                    "policy_nnodes": 1,
+                    "gpus_per_policy": 8,
+                },
+            }
+        )
+
+        managers = _build_policy_resource_pool_managers(config, actor_role=Role.ActorRollout)
+
+        self.assertEqual(len(managers), 1)
+        self.assertIn(Role.ActorRollout, managers[0].mapping)
+        self.assertNotIn(Role.Critic, managers[0].mapping)
+        self.assertNotIn(Role.RefPolicy, managers[0].mapping)
+
+    def test_build_policy_resource_pool_managers_registers_ref_policy_when_needed(self):
+        from orchrl.trainer.train import _build_policy_resource_pool_managers
+        from verl.trainer.ppo.ray_trainer import Role
+
+        config = OmegaConf.create(
+            {
+                "models": {
+                    "model_0": {
+                        "name": "policy_a",
+                        "ppo_trainer_config": {
+                            "critic": {"enable": False},
+                            "actor_rollout_ref": {
+                                "actor": {"use_kl_loss": True},
+                            },
+                            "algorithm": {"use_kl_in_reward": False},
+                        },
+                    }
+                },
+                "resource": {
+                    "n_gpus_per_node": 8,
+                    "policy_nnodes": 1,
+                    "gpus_per_policy": 8,
+                },
+            }
+        )
+
+        managers = _build_policy_resource_pool_managers(config, actor_role=Role.ActorRollout)
+
+        self.assertEqual(managers[0].mapping[Role.ActorRollout], "global_pool_model_0")
+        self.assertEqual(managers[0].mapping[Role.RefPolicy], "global_pool_model_0")
+
+    def test_build_policy_resource_pool_managers_keeps_critic_when_enabled(self):
+        from orchrl.trainer.train import _build_policy_resource_pool_managers
+        from verl.trainer.ppo.ray_trainer import Role
+
+        config = OmegaConf.create(
+            {
+                "models": {
+                    "model_0": {
+                        "name": "policy_a",
+                        "ppo_trainer_config": {
+                            "critic": {"enable": True},
+                            "actor_rollout_ref": {
+                                "actor": {"use_kl_loss": False},
+                            },
+                            "algorithm": {"use_kl_in_reward": False},
+                        },
+                    }
+                },
+                "resource": {
+                    "n_gpus_per_node": 8,
+                    "policy_nnodes": 1,
+                    "gpus_per_policy": 8,
+                },
+            }
+        )
+
+        managers = _build_policy_resource_pool_managers(config, actor_role=Role.ActorRollout)
+
+        self.assertEqual(managers[0].mapping[Role.ActorRollout], "global_pool_model_0")
+        self.assertEqual(managers[0].mapping[Role.Critic], "global_pool_model_0")
+        self.assertNotIn(Role.RefPolicy, managers[0].mapping)
 
 
 class MateRuntimeBehaviorTests(unittest.TestCase):
@@ -1498,6 +2176,60 @@ class TrainingStepExecutorBehaviorTests(unittest.TestCase):
         self.assertEqual(metrics["mas/train/verifier_yes_rate"], 0.5)
         self.assertEqual(metrics["mas/train/verifier_no_rate"], 0.5)
 
+    def test_step_executor_uses_mate_role_mapping_for_role_indices_in_role_sharing(self):
+        from orchrl.trainer.training_step_executor import TrainingStepExecutor
+
+        registry = SimpleNamespace(
+            get_checkpoint_managers=lambda: {},
+            get_tokenizers=lambda: {"policy_a": "tok-a"},
+            ppo_trainer_dict={
+                "policy_a": SimpleNamespace(
+                    config=OmegaConf.create(
+                        {"data": {"max_prompt_length": 32, "max_response_length": 16}}
+                    )
+                )
+            },
+        )
+        mate_runtime = SimpleNamespace(
+            mate_rollout_adapter=SimpleNamespace(
+                collect_step_rollouts=mock.AsyncMock(return_value=["episode-a"])
+            ),
+            mate_config={
+                "role_policy_mapping": {
+                    "verifier": "policy_a",
+                    "searcher": "policy_a",
+                    "answerer": "policy_a",
+                },
+                "rollout_mode": "parallel",
+            },
+        )
+
+        with (
+            mock.patch(
+                "orchrl.trainer.training_step_executor.maybe_export_prompt_trajectories"
+            ),
+            mock.patch(
+                "orchrl.trainer.training_step_executor.episodes_to_policy_batches",
+                return_value={"policy_a": "batch-a"},
+            ) as adapter_mock,
+        ):
+            executor = TrainingStepExecutor(
+                config=OmegaConf.create(
+                    {"training": {"max_prompt_length": None, "max_response_length": None}}
+                ),
+                policy_trainer_registry=registry,
+                mate_runtime=mate_runtime,
+                agent_policy_mapping={"verifier": "policy_a"},
+                agent_untrained=[],
+            )
+            output = executor.collect_mate_step_batches(step_idx=0)
+
+        self.assertEqual(output, {"policy_a": "batch-a"})
+        self.assertEqual(
+            adapter_mock.call_args.kwargs["role_index_mapping"],
+            {"verifier": 0, "searcher": 1, "answerer": 2},
+        )
+
     def test_multi_agents_trainer_collect_phase_delegates_to_training_step_executor(self):
         trainer = MultiAgentsPPOTrainer.__new__(MultiAgentsPPOTrainer)
         trainer.global_steps = 4
@@ -1660,6 +2392,89 @@ class MASLauncherLoggingTests(unittest.TestCase):
 
         self.assertTrue(str(stdout_path).endswith("ep-1.stdout.log"))
         self.assertTrue(str(stderr_path).endswith("ep-1.stderr.log"))
+
+
+class MCoreCompatTests(unittest.TestCase):
+    def test_patch_mbridge_autobridge_api_accepts_dtype_kwarg(self):
+        from orchrl.utils import mcore_compat
+
+        fake_bridge_instance = object()
+
+        class _FakeAutoBridge:
+            pass
+
+        def _legacy_from_config(cls, hf_config):
+            return ("legacy", hf_config)
+
+        def _legacy_from_pretrained(cls, hf_model_path, trust_remote_code=False):
+            return ("legacy_pretrained", hf_model_path, trust_remote_code)
+
+        _FakeAutoBridge.from_config = classmethod(_legacy_from_config)
+        _FakeAutoBridge.from_pretrained = classmethod(_legacy_from_pretrained)
+
+        fake_registry = {"qwen3_moe": lambda hf_config, **kwargs: fake_bridge_instance}
+        fake_hf_config = SimpleNamespace(model_type="qwen3_moe")
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "mbridge.core.auto_bridge": SimpleNamespace(AutoBridge=_FakeAutoBridge),
+                        "mbridge.core.bridge": SimpleNamespace(_MODEL_REGISTRY=fake_registry),
+                    },
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mcore_compat,
+                    "AutoConfig",
+                    create=True,
+                    new=SimpleNamespace(from_pretrained=lambda *args, **kwargs: fake_hf_config),
+                )
+            )
+
+            patched = mcore_compat.patch_mbridge_autobridge_api()
+
+            self.assertTrue(patched)
+            self.assertIs(
+                _FakeAutoBridge.from_config(fake_hf_config, dtype="bf16"),
+                fake_bridge_instance,
+            )
+
+    def test_patch_mbridge_transformer_engine_fallback_forces_non_te(self):
+        from orchrl.utils import mcore_compat
+
+        fake_calls = []
+
+        def _fake_get_gpt_decoder_block_spec(config, use_transformer_engine, **kwargs):
+            fake_calls.append((config, use_transformer_engine, kwargs))
+            return "layer-spec"
+
+        fake_llm_bridge_module = SimpleNamespace(
+            LLMBridge=type("FakeLLMBridge", (), {}),
+            get_gpt_decoder_block_spec=_fake_get_gpt_decoder_block_spec,
+        )
+        fake_bridge = fake_llm_bridge_module.LLMBridge()
+        fake_bridge.config = SimpleNamespace(normalization="RMSNorm")
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch("orchrl.utils.mcore_compat.importlib.util.find_spec", return_value=None)
+            )
+            stack.enter_context(
+                mock.patch.dict(
+                    sys.modules,
+                    {"mbridge.core.llm_bridge": fake_llm_bridge_module},
+                )
+            )
+
+            patched = mcore_compat.patch_mbridge_transformer_engine_fallback()
+            result = fake_bridge._get_transformer_layer_spec()
+
+        self.assertTrue(patched)
+        self.assertEqual(result, "layer-spec")
+        self.assertEqual(fake_calls[0][1], False)
 
 
 class MultiAgentsTrainerLoggingCompatibilityTests(unittest.TestCase):

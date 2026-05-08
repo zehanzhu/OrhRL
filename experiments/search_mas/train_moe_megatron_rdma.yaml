@@ -1,0 +1,589 @@
+defaults:
+- ../../orchrl/config/ppo_trainer@models.model_0.ppo_trainer_config: base
+- ../../orchrl/config/ppo_trainer@models.model_1.ppo_trainer_config: base
+- ../../orchrl/config/ppo_trainer@models.model_2.ppo_trainer_config: base
+- _self_
+
+workflow_type: external_mas
+specialization: role_specific
+
+resource:
+  # Role-specific Megatron-MoE keeps one 8-GPU policy pool per role. Use an
+  # existing Ray cluster with at least 24 GPUs for verifier/searcher/answerer.
+  ray_address: auto
+  run_training_in_driver: true
+  nnodes: 1
+  n_gpus_per_node: 8
+  gpus_per_policy: 8
+  policy_nnodes: 1
+  policy_bundle_resources:
+    worker: 0.001
+  trust_remote_code: true
+
+env:
+  name: search_env
+  dataset: drmas_search
+  benchmark: drmas_search_nosearch
+  multi_modal: false
+  batched_init: true
+
+agent_policy_configs:
+  agent_configs:
+    agent_0:
+      name: verifier
+      policy_name: verifier_model
+      train_llm_config:
+        enable_thinking: false
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        min_p: 0.0
+      val_llm_config:
+        enable_thinking: false
+        temperature: 0.6
+        top_p: 1.0
+        top_k: 20
+        min_p: 0.0
+    agent_1:
+      name: searcher
+      policy_name: searcher_model
+      train_llm_config:
+        enable_thinking: false
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        min_p: 0.0
+      val_llm_config:
+        enable_thinking: false
+        temperature: 0.6
+        top_p: 1.0
+        top_k: 20
+        min_p: 0.0
+    agent_2:
+      name: answerer
+      policy_name: answerer_model
+      train_llm_config:
+        enable_thinking: false
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        min_p: 0.0
+      val_llm_config:
+        enable_thinking: false
+        temperature: 0.6
+        top_p: 1.0
+        top_k: 20
+        min_p: 0.0
+
+base_models:
+  policy_0:
+    path: /home/tiger/models/Qwen3-30B-A3B-Instruct-2507
+    name: verifier_model
+  policy_1:
+    path: /home/tiger/models/Qwen3-30B-A3B-Instruct-2507
+    name: searcher_model
+  policy_2:
+    path: /home/tiger/models/Qwen3-30B-A3B-Instruct-2507
+    name: answerer_model
+
+training:
+  rollout_source: mate
+  device: cuda
+  total_training_steps: 500
+  project_name: orchrl
+  experiment_name: search_mas_megatron_moe_role_specific
+  output_root_dir: outputs/training_runs
+  data_root_dir: /mnt/bn/chenghao1026/zzh/drmas_search_mas
+  train_data_path: ${training.data_root_dir}/train.parquet
+  val_data_path: ${training.data_root_dir}/test_sampled.parquet
+  run_name: ${training.experiment_name}
+  run_id: role_specific_smoke
+  run_dir: ${training.output_root_dir}/${training.run_name}/${training.run_id}
+  logger:
+  - console
+  - wandb
+  if_save: false
+  model_checkpoints_dir: ${training.run_dir}/checkpoints
+  ray_wait_register_center_timeout: 1000
+  train_batch_size: 8
+  validate_batch_size: 32
+  train_sample_num: 1
+  sample_temperature: 0.6
+  val_freq: 20
+  max_prompt_length: 1536
+  max_response_length: 1024
+  mate:
+    roles: [verifier, searcher, answerer]
+    role_policy_mapping:
+      verifier: verifier_model
+      searcher: searcher_model
+      answerer: answerer_model
+    max_prompt_length: ${training.max_prompt_length}
+    max_response_length: ${training.max_response_length}
+    prompt_truncation: left
+    batch_size: ${training.train_batch_size}
+    n_samples_per_prompt: 6
+    rollout_mode: parallel
+    max_concurrent_episodes: 16
+    monitor_pool:
+      size: 16
+      host: 127.0.0.1
+      base_port: 19000
+      acquire_timeout_sec: 300
+      actor_resources:
+        head: 0.001
+    timeout: 120
+    backend_timeout: 120
+    credit_assignment: all_turns
+    failure_policy:
+      mode: threshold
+      max_failed_rate: 0.999
+    mas_work_dir: mas_apps/search
+    mas_log_dir: ${training.run_dir}/mas_logs
+    mas_command_template: python scripts/run_search_mas.py --config {config_path} --question {prompt}
+    config_template_path: mas_apps/search/configs/inference.yaml
+    prompt_loader:
+      source_type: parquet
+      path: ${training.train_data_path}
+      prompt_keys: [question, prompt, query, problem, input]
+      expected_keys: [expected_answer, answer, expected_answers, gold_answer, golden_answers, target, label]
+      train_repeat: true
+      train_shuffle: true
+      train_seed: 0
+    reward:
+      provider: task_plugins.search_mas.reward:compute_reward
+      match_mode: exact
+    trajectory_export:
+      enable: true
+      output_dir: ${training.run_dir}/trajectories
+      write_json: true
+      write_txt: true
+      include_token_details: true
+      answer_stats_provider: task_plugins.search_mas.reward:build_answer_stats
+      answer_stats_kwargs:
+        match_mode: exact
+
+models:
+  model_0:
+    path: ${base_models.policy_0.path}
+    name: ${base_models.policy_0.name}
+    ppo_trainer_config:
+      filter_method: uid
+      filter_ratio: 0.0
+      data:
+        train_files: ${training.train_data_path}
+        val_files: ${training.val_data_path}
+        max_prompt_length: ${training.max_prompt_length}
+        max_response_length: ${training.max_response_length}
+      actor_rollout_ref:
+        model:
+          path: ${base_models.policy_0.path}
+          override_config:
+            model_id: ${base_models.policy_0.name}
+        actor:
+          _target_: verl.workers.config.McoreActorConfig
+          strategy: megatron
+          load_weight: true
+          optim:
+            _target_: verl.workers.config.McoreOptimizerConfig
+            lr: 1e-6
+            lr_warmup_steps_ratio: 0.0
+            total_training_steps: -1
+            weight_decay: 0.01
+            lr_warmup_steps: -1
+            betas: [0.9, 0.999]
+            clip_grad: 1.0
+            optimizer: adam
+            lr_warmup_init: 0.0
+            lr_decay_steps: null
+            lr_decay_style: constant
+            min_lr: 0.0
+            weight_decay_incr_style: constant
+            lr_wsd_decay_style: exponential
+            lr_wsd_decay_steps: null
+            use_checkpoint_opt_param_scheduler: false
+            override_optimizer_config:
+              optimizer_offload_fraction: 1.0
+              overlap_cpu_optimizer_d2h_h2d: true
+              use_precision_aware_optimizer: true
+              optimizer_cpu_offload: true
+          use_kl_loss: false
+          router_replay:
+            _target_: verl.workers.config.RouterReplayConfig
+            mode: R2
+            record_file: null
+            replay_file: null
+          ppo_mini_batch_size: 16
+          ppo_micro_batch_size_per_gpu: 2
+          ppo_max_token_len_per_gpu: 4096
+          ppo_epochs: 1
+          megatron:
+            _target_: verl.workers.config.McoreEngineConfig
+            dtype: bfloat16
+            tensor_model_parallel_size: 2
+            pipeline_model_parallel_size: 1
+            virtual_pipeline_model_parallel_size: null
+            context_parallel_size: 4
+            expert_model_parallel_size: 4
+            expert_tensor_parallel_size: null
+            sequence_parallel: true
+            use_distributed_optimizer: true
+            use_dist_checkpointing: false
+            dist_checkpointing_path: null
+            dist_checkpointing_prefix: ""
+            param_offload: true
+            grad_offload: true
+            optimizer_offload: true
+            seed: 42
+            override_ddp_config: {}
+            override_transformer_config: {}
+            override_mcore_model_config: {}
+            use_mbridge: true
+            vanilla_mbridge: true
+            use_remove_padding: true
+            forward_only: false
+        ref:
+          _target_: verl.workers.config.McoreActorConfig
+          strategy: megatron
+          load_weight: true
+          log_prob_micro_batch_size: null
+          log_prob_micro_batch_size_per_gpu: 1
+          log_prob_use_dynamic_bsz: false
+          log_prob_max_token_len_per_gpu: 4096
+          megatron:
+            _target_: verl.workers.config.McoreEngineConfig
+            dtype: bfloat16
+            tensor_model_parallel_size: 2
+            pipeline_model_parallel_size: 1
+            virtual_pipeline_model_parallel_size: null
+            context_parallel_size: 4
+            expert_model_parallel_size: 4
+            expert_tensor_parallel_size: null
+            sequence_parallel: true
+            use_distributed_optimizer: true
+            use_dist_checkpointing: false
+            dist_checkpointing_path: null
+            dist_checkpointing_prefix: ""
+            param_offload: true
+            grad_offload: true
+            optimizer_offload: true
+            seed: 42
+            override_ddp_config: {}
+            override_transformer_config: {}
+            override_mcore_model_config: {}
+            use_mbridge: true
+            vanilla_mbridge: true
+            use_remove_padding: true
+            forward_only: true
+        rollout:
+          name: vllm
+          mode: async
+          nnodes: 1
+          n_gpus_per_node: 8
+          temperature: ${training.sample_temperature}
+          prompt_length: ${training.max_prompt_length}
+          response_length: ${training.max_response_length}
+          max_model_len: 2560
+          max_num_batched_tokens: 2560
+          max_num_seqs: 2
+          log_prob_micro_batch_size: null
+          log_prob_micro_batch_size_per_gpu: 1
+          log_prob_use_dynamic_bsz: false
+          log_prob_max_token_len_per_gpu: 4096
+          tensor_model_parallel_size: 8
+          pipeline_model_parallel_size: 1
+          expert_parallel_size: 1
+          enforce_eager: false
+          gpu_memory_utilization: 0.45
+          prometheus:
+            served_model_name: verifier_model
+        trainer:
+          n_gpus_per_node: 8
+          n_training_gpus_per_node: 8
+      critic:
+        enable: false
+      algorithm:
+        adv_estimator: grpo
+        use_kl_in_reward: false
+  model_1:
+    path: ${base_models.policy_1.path}
+    name: ${base_models.policy_1.name}
+    ppo_trainer_config:
+      filter_method: uid
+      filter_ratio: 0.0
+      data:
+        train_files: ${training.train_data_path}
+        val_files: ${training.val_data_path}
+        max_prompt_length: ${training.max_prompt_length}
+        max_response_length: ${training.max_response_length}
+      actor_rollout_ref:
+        model:
+          path: ${base_models.policy_1.path}
+          override_config:
+            model_id: ${base_models.policy_1.name}
+        actor:
+          _target_: verl.workers.config.McoreActorConfig
+          strategy: megatron
+          load_weight: true
+          optim:
+            _target_: verl.workers.config.McoreOptimizerConfig
+            lr: 1e-6
+            lr_warmup_steps_ratio: 0.0
+            total_training_steps: -1
+            weight_decay: 0.01
+            lr_warmup_steps: -1
+            betas: [0.9, 0.999]
+            clip_grad: 1.0
+            optimizer: adam
+            lr_warmup_init: 0.0
+            lr_decay_steps: null
+            lr_decay_style: constant
+            min_lr: 0.0
+            weight_decay_incr_style: constant
+            lr_wsd_decay_style: exponential
+            lr_wsd_decay_steps: null
+            use_checkpoint_opt_param_scheduler: false
+            override_optimizer_config:
+              optimizer_offload_fraction: 1.0
+              overlap_cpu_optimizer_d2h_h2d: true
+              use_precision_aware_optimizer: true
+              optimizer_cpu_offload: true
+          use_kl_loss: false
+          router_replay:
+            _target_: verl.workers.config.RouterReplayConfig
+            mode: R2
+            record_file: null
+            replay_file: null
+          ppo_mini_batch_size: 16
+          ppo_micro_batch_size_per_gpu: 2
+          ppo_max_token_len_per_gpu: 4096
+          ppo_epochs: 1
+          megatron:
+            _target_: verl.workers.config.McoreEngineConfig
+            dtype: bfloat16
+            tensor_model_parallel_size: 2
+            pipeline_model_parallel_size: 1
+            virtual_pipeline_model_parallel_size: null
+            context_parallel_size: 4
+            expert_model_parallel_size: 4
+            expert_tensor_parallel_size: null
+            sequence_parallel: true
+            use_distributed_optimizer: true
+            use_dist_checkpointing: false
+            dist_checkpointing_path: null
+            dist_checkpointing_prefix: ""
+            param_offload: true
+            grad_offload: true
+            optimizer_offload: true
+            seed: 42
+            override_ddp_config: {}
+            override_transformer_config: {}
+            override_mcore_model_config: {}
+            use_mbridge: true
+            vanilla_mbridge: true
+            use_remove_padding: true
+            forward_only: false
+        ref:
+          _target_: verl.workers.config.McoreActorConfig
+          strategy: megatron
+          load_weight: true
+          log_prob_micro_batch_size: null
+          log_prob_micro_batch_size_per_gpu: 1
+          log_prob_use_dynamic_bsz: false
+          log_prob_max_token_len_per_gpu: 4096
+          megatron:
+            _target_: verl.workers.config.McoreEngineConfig
+            dtype: bfloat16
+            tensor_model_parallel_size: 2
+            pipeline_model_parallel_size: 1
+            virtual_pipeline_model_parallel_size: null
+            context_parallel_size: 4
+            expert_model_parallel_size: 4
+            expert_tensor_parallel_size: null
+            sequence_parallel: true
+            use_distributed_optimizer: true
+            use_dist_checkpointing: false
+            dist_checkpointing_path: null
+            dist_checkpointing_prefix: ""
+            param_offload: true
+            grad_offload: true
+            optimizer_offload: true
+            seed: 42
+            override_ddp_config: {}
+            override_transformer_config: {}
+            override_mcore_model_config: {}
+            use_mbridge: true
+            vanilla_mbridge: true
+            use_remove_padding: true
+            forward_only: true
+        rollout:
+          name: vllm
+          mode: async
+          nnodes: 1
+          n_gpus_per_node: 8
+          temperature: ${training.sample_temperature}
+          prompt_length: ${training.max_prompt_length}
+          response_length: ${training.max_response_length}
+          max_model_len: 2560
+          max_num_batched_tokens: 2560
+          max_num_seqs: 2
+          log_prob_micro_batch_size: null
+          log_prob_micro_batch_size_per_gpu: 1
+          log_prob_use_dynamic_bsz: false
+          log_prob_max_token_len_per_gpu: 4096
+          tensor_model_parallel_size: 8
+          pipeline_model_parallel_size: 1
+          expert_parallel_size: 1
+          enforce_eager: false
+          gpu_memory_utilization: 0.45
+          prometheus:
+            served_model_name: searcher_model
+        trainer:
+          n_gpus_per_node: 8
+          n_training_gpus_per_node: 8
+      critic:
+        enable: false
+      algorithm:
+        adv_estimator: grpo
+        use_kl_in_reward: false
+  model_2:
+    path: ${base_models.policy_2.path}
+    name: ${base_models.policy_2.name}
+    ppo_trainer_config:
+      filter_method: uid
+      filter_ratio: 0.0
+      data:
+        train_files: ${training.train_data_path}
+        val_files: ${training.val_data_path}
+        max_prompt_length: ${training.max_prompt_length}
+        max_response_length: ${training.max_response_length}
+      actor_rollout_ref:
+        model:
+          path: ${base_models.policy_2.path}
+          override_config:
+            model_id: ${base_models.policy_2.name}
+        actor:
+          _target_: verl.workers.config.McoreActorConfig
+          strategy: megatron
+          load_weight: true
+          optim:
+            _target_: verl.workers.config.McoreOptimizerConfig
+            lr: 1e-6
+            lr_warmup_steps_ratio: 0.0
+            total_training_steps: -1
+            weight_decay: 0.01
+            lr_warmup_steps: -1
+            betas: [0.9, 0.999]
+            clip_grad: 1.0
+            optimizer: adam
+            lr_warmup_init: 0.0
+            lr_decay_steps: null
+            lr_decay_style: constant
+            min_lr: 0.0
+            weight_decay_incr_style: constant
+            lr_wsd_decay_style: exponential
+            lr_wsd_decay_steps: null
+            use_checkpoint_opt_param_scheduler: false
+            override_optimizer_config:
+              optimizer_offload_fraction: 1.0
+              overlap_cpu_optimizer_d2h_h2d: true
+              use_precision_aware_optimizer: true
+              optimizer_cpu_offload: true
+          use_kl_loss: false
+          router_replay:
+            _target_: verl.workers.config.RouterReplayConfig
+            mode: R2
+            record_file: null
+            replay_file: null
+          ppo_mini_batch_size: 16
+          ppo_micro_batch_size_per_gpu: 2
+          ppo_max_token_len_per_gpu: 4096
+          ppo_epochs: 1
+          megatron:
+            _target_: verl.workers.config.McoreEngineConfig
+            dtype: bfloat16
+            tensor_model_parallel_size: 2
+            pipeline_model_parallel_size: 1
+            virtual_pipeline_model_parallel_size: null
+            context_parallel_size: 4
+            expert_model_parallel_size: 4
+            expert_tensor_parallel_size: null
+            sequence_parallel: true
+            use_distributed_optimizer: true
+            use_dist_checkpointing: false
+            dist_checkpointing_path: null
+            dist_checkpointing_prefix: ""
+            param_offload: true
+            grad_offload: true
+            optimizer_offload: true
+            seed: 42
+            override_ddp_config: {}
+            override_transformer_config: {}
+            override_mcore_model_config: {}
+            use_mbridge: true
+            vanilla_mbridge: true
+            use_remove_padding: true
+            forward_only: false
+        ref:
+          _target_: verl.workers.config.McoreActorConfig
+          strategy: megatron
+          load_weight: true
+          log_prob_micro_batch_size: null
+          log_prob_micro_batch_size_per_gpu: 1
+          log_prob_use_dynamic_bsz: false
+          log_prob_max_token_len_per_gpu: 4096
+          megatron:
+            _target_: verl.workers.config.McoreEngineConfig
+            dtype: bfloat16
+            tensor_model_parallel_size: 2
+            pipeline_model_parallel_size: 1
+            virtual_pipeline_model_parallel_size: null
+            context_parallel_size: 4
+            expert_model_parallel_size: 4
+            expert_tensor_parallel_size: null
+            sequence_parallel: true
+            use_distributed_optimizer: true
+            use_dist_checkpointing: false
+            dist_checkpointing_path: null
+            dist_checkpointing_prefix: ""
+            param_offload: true
+            grad_offload: true
+            optimizer_offload: true
+            seed: 42
+            override_ddp_config: {}
+            override_transformer_config: {}
+            override_mcore_model_config: {}
+            use_mbridge: true
+            vanilla_mbridge: true
+            use_remove_padding: true
+            forward_only: true
+        rollout:
+          name: vllm
+          mode: async
+          nnodes: 1
+          n_gpus_per_node: 8
+          temperature: ${training.sample_temperature}
+          prompt_length: ${training.max_prompt_length}
+          response_length: ${training.max_response_length}
+          max_model_len: 2560
+          max_num_batched_tokens: 2560
+          max_num_seqs: 2
+          log_prob_micro_batch_size: null
+          log_prob_micro_batch_size_per_gpu: 1
+          log_prob_use_dynamic_bsz: false
+          log_prob_max_token_len_per_gpu: 4096
+          tensor_model_parallel_size: 8
+          pipeline_model_parallel_size: 1
+          expert_parallel_size: 1
+          enforce_eager: false
+          gpu_memory_utilization: 0.45
+          prometheus:
+            served_model_name: answerer_model
+        trainer:
+          n_gpus_per_node: 8
+          n_training_gpus_per_node: 8
+      critic:
+        enable: false
+      algorithm:
+        adv_estimator: grpo
+        use_kl_in_reward: false

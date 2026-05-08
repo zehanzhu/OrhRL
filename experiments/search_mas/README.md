@@ -19,6 +19,14 @@ The Search MAS application itself stays under `mas_apps/search/` because it is a
 
 At training startup, OrchRL resolves `training.run_dir`, `training.model_checkpoints_dir`, and `training.mate.trajectory_export.output_dir`, then creates those directories automatically. The launcher log file is also written under `outputs/logs/`. MAS subprocess logs are written under `training.mate.mas_log_dir`.
 
+For Megatron-based training, `run_train_e2e.sh` also prepends `ORCHRL_MEGATRON_LM_HOME` to `PYTHONPATH`. By default it uses `/mnt/bn/chenghao1026/resouces/libs/Megatron-LM`. Override this env var if Megatron-LM is installed elsewhere.
+
+For bridge-side Python deps, the launcher also prepends `ORCHRL_MCORE_PYDEPS_HOME` to `PYTHONPATH`. By default it points to `/mnt/bn/chenghao1026/resouces/libs/verl-mcore-pydeps-0131`, which can host an isolated `mbridge` install without re-enabling broken user-site packages.
+
+For Transformer Engine, the launcher prepends `ORCHRL_TRANSFORMER_ENGINE_HOME` to `PYTHONPATH` and also extends `LD_LIBRARY_PATH` with Torch/CUDA/NCCL runtime libs. By default it points to `/mnt/bn/chenghao1026/resouces/libs/transformer-engine-cu128-torch290`, which contains a source-rebuilt `transformer_engine_torch` matched to `torch 2.9.0+cu128`.
+
+The launcher also defaults `PYTHONNOUSERSITE=1` so user-site packages under `~/.local` do not shadow the cluster PyTorch/CUDA stack. This is important when a broken local `transformer_engine` install exists.
+
 Dataset paths are centralized in `train.yaml`:
 
 - `training.data_root_dir`

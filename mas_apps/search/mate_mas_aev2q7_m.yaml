@@ -3,7 +3,7 @@ application:
   max_turns: 4
   force_final_answer_on_max_turn: true
 llm:
-  base_url: http://127.0.0.1:8000/v1
+  base_url: http://127.0.0.1:19001/leases/5e70dd90e4ba472698ff74b1d75f17bb/v1
   api_key: ${OPENAI_API_KEY}
   timeout: 120
   max_retries: 3
@@ -13,8 +13,8 @@ llm:
   top_p: 0.95
   max_tokens: 1024
 search:
-  provider: http # http | disabled
-  retrieval_service_url: http://10.122.240.230:8010/retrieve
+  provider: http
+  retrieval_service_url: http://10.122.241.235:8010/retrieve
   topk: 2
   return_scores: true
   timeout: 30
@@ -26,16 +26,19 @@ agents:
     temperature: 0.2
     top_p: 0.95
     max_tokens: 1024
+    model: verifier
   searcher:
     llm: null
     temperature: 0.6
     top_p: 0.95
     max_tokens: 1024
+    model: searcher
   answerer:
     llm: null
     temperature: 0.4
     top_p: 0.95
     max_tokens: 1024
+    model: answerer
 data:
   input_path: ~/data/drmas_search_mas/test_sampled.parquet
 output:

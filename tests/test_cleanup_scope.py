@@ -104,6 +104,108 @@ class CleanupScopeTests(unittest.TestCase):
 
         self.assertTrue(ray_init_mock.called)
 
+    def test_init_ray_local_runtime_disables_dashboard_and_forces_ipv4(self):
+        from orchrl.utils.ray_utils import init_ray_with_temp_dirs
+
+        fake_context = mock.Mock(
+            address_info={"session_dir": "/tmp/verl_ray_321/session_xyz"}
+        )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "BYTED_RAY_POD_IP": "2605:340:cd51:602:d46a:ef3e:9ae4:cb96",
+                    "RAY_IP": "2605:340:cd51:602:d46a:ef3e:9ae4:cb96",
+                    "MY_HOST_IP": "10.122.123.189",
+                },
+                clear=False,
+            ),
+            mock.patch("orchrl.utils.ray_utils.os.makedirs"),
+            mock.patch("orchrl.utils.ray_utils.os.getpid", return_value=321),
+            mock.patch("orchrl.utils.ray_utils.ray.is_initialized", return_value=False),
+            mock.patch("orchrl.utils.ray_utils.ray.init", return_value=fake_context) as ray_init_mock,
+            mock.patch("orchrl.utils.clean_up.register_temp_dirs"),
+            mock.patch("orchrl.utils.clean_up.register_ray_process_matchers"),
+        ):
+            init_ray_with_temp_dirs()
+            ray_init_kwargs = ray_init_mock.call_args.kwargs
+            self.assertFalse(ray_init_kwargs["include_dashboard"])
+            self.assertEqual(ray_init_kwargs["_node_ip_address"], "10.122.123.189")
+            self.assertEqual(os.environ["BYTED_RAY_POD_IP"], "10.122.123.189")
+            self.assertEqual(os.environ["RAY_IP"], "10.122.123.189")
+
+    def test_local_ray_process_env_overrides_force_ipv4_for_child_processes(self):
+        from orchrl.utils.ray_utils import _init_local_ray_with_process_env_overrides
+        import ray._private.services as ray_services
+
+        observed_env_updates = {}
+
+        def fake_start_ray_process(*args, **kwargs):
+            observed_env_updates.update(kwargs.get("env_updates") or {})
+            return object()
+
+        def fake_ray_init(**kwargs):
+            ray_services.start_ray_process(
+                command=["fake-raylet"],
+                process_type="raylet",
+                fate_share=False,
+            )
+            return mock.Mock(address_info={})
+
+        with (
+            mock.patch.object(ray_services, "start_ray_process", side_effect=fake_start_ray_process),
+            mock.patch("orchrl.utils.ray_utils.ray.init", side_effect=fake_ray_init),
+        ):
+            _init_local_ray_with_process_env_overrides(
+                {"include_dashboard": False, "_node_ip_address": "10.122.123.189"},
+                "10.122.123.189",
+            )
+
+        self.assertEqual(observed_env_updates["BYTED_RAY_POD_IP"], "10.122.123.189")
+        self.assertEqual(observed_env_updates["RAY_IP"], "10.122.123.189")
+        self.assertEqual(observed_env_updates["MY_HOST_IP"], "10.122.123.189")
+        self.assertEqual(observed_env_updates["MY_POD_IP"], "10.122.123.189")
+        self.assertEqual(observed_env_updates["MY_HOST_IPV6"], "")
+        self.assertEqual(observed_env_updates["MY_POD_IPV6"], "")
+
+    def test_init_ray_local_runtime_uses_system_cpu_count_by_default(self):
+        from orchrl.utils.ray_utils import init_ray_with_temp_dirs
+
+        fake_context = mock.Mock(
+            address_info={"session_dir": "/tmp/verl_ray_654/session_xyz"}
+        )
+        config = mock.Mock()
+        config.resource = mock.Mock(n_gpus_per_node=8, trainer_remote_num_cpus=None)
+        config.resource.ray_address = None
+        config.training = mock.Mock(run_dir="outputs/training_runs/test_run")
+        config.ray_kwargs = None
+
+        with (
+            mock.patch("orchrl.utils.ray_utils.os.makedirs"),
+            mock.patch("orchrl.utils.ray_utils.os.getpid", return_value=654),
+            mock.patch("orchrl.utils.ray_utils.os.cpu_count", return_value=120),
+            mock.patch("orchrl.utils.ray_utils.ray.is_initialized", return_value=False),
+            mock.patch(
+                "orchrl.utils.ray_utils._init_local_ray_with_process_env_overrides",
+                return_value=fake_context,
+            ) as init_local_mock,
+            mock.patch("orchrl.utils.clean_up.register_temp_dirs"),
+            mock.patch("orchrl.utils.clean_up.register_ray_process_matchers"),
+        ):
+            init_ray_with_temp_dirs(config)
+
+        ray_init_kwargs = init_local_mock.call_args.args[0]
+        self.assertEqual(ray_init_kwargs["num_cpus"], 120)
+
+    def test_local_ray_process_env_overrides_disable_worker_prestart(self):
+        from orchrl.utils.ray_utils import _build_local_ray_process_env_overrides
+
+        env_overrides = _build_local_ray_process_env_overrides("10.122.123.189")
+
+        self.assertEqual(env_overrides["RAY_enable_worker_prestart"], "false")
+        self.assertEqual(env_overrides["RAY_prestart_worker_first_driver"], "false")
+
     def test_install_cleanup_hooks_use_runtime_cleanup_for_exit_and_signals(self):
         import orchrl.utils.clean_up as clean_up
 
