@@ -9,6 +9,10 @@ from orchrl.trainer.specialization_mode import (
     ROLE_SPECIFIC,
     validate_specialization_mode,
 )
+from orchrl.trainer.policy_backend import (
+    VerlPPOPolicyBackend,
+    build_policy_backends_from_trainers,
+)
 from orchrl.utils.performance import colorful_print
 from orchrl.utils.served_model_name import resolve_policy_server_name
 
@@ -34,11 +38,38 @@ class PolicyTrainerRegistry:
 
         self.ppo_trainer_config_dict = {}
         self.ppo_trainer_dict = {}
+        self.policy_backend_dict = {}
         self.async_rollout_manager_dict = {}
         self.checkpoint_manager_dict = {}
         self.tokenizer_dict = {}
         self.server_handle_dict = {}
         self.policy_server_name_mapping = {}
+
+    def _register_policy_trainer(self, model_name: str, ppo_trainer):
+        self.ppo_trainer_dict[model_name] = ppo_trainer
+        policy_server_name = resolve_policy_server_name(
+            model_name,
+            self.ppo_trainer_config_dict.get(model_name),
+        )
+        self.policy_backend_dict[model_name] = VerlPPOPolicyBackend(
+            model_name=model_name,
+            trainer=ppo_trainer,
+            policy_server_name=policy_server_name,
+        )
+
+    def _ensure_policy_backends(self):
+        self.policy_backend_dict = build_policy_backends_from_trainers(
+            self.ppo_trainer_dict,
+            existing_backends=self.policy_backend_dict,
+            policy_server_name_mapping={
+                model_name: resolve_policy_server_name(
+                    model_name,
+                    self.ppo_trainer_config_dict.get(model_name),
+                )
+                for model_name in self.ppo_trainer_dict.keys()
+            },
+        )
+        return self.policy_backend_dict
 
     def initialize_ppo_trainers(self):
         specialization = validate_specialization_mode(self.config.specialization)
@@ -89,7 +120,7 @@ class PolicyTrainerRegistry:
             ray_worker_group_cls=self.ray_worker_group_cls,
         )
         ppo_trainer.global_steps = 0
-        self.ppo_trainer_dict[model_name] = ppo_trainer
+        self._register_policy_trainer(model_name, ppo_trainer)
 
     def create_multiple_ppo_trainers(self):
         config = self.config
@@ -123,26 +154,27 @@ class PolicyTrainerRegistry:
                 ray_worker_group_cls=self.ray_worker_group_cls,
             )
             ppo_trainer.global_steps = 0
-            self.ppo_trainer_dict[model_name] = ppo_trainer
+            self._register_policy_trainer(model_name, ppo_trainer)
 
     def init_workers(self):
         colorful_print("Initializing workers for all PPO trainers...", "cyan")
-        if not self.ppo_trainer_dict:
+        policy_backends = self._ensure_policy_backends()
+        if not policy_backends:
             colorful_print("No PPO trainers to initialize", "yellow")
             return
 
-        total_trainers = len(self.ppo_trainer_dict)
+        total_trainers = len(policy_backends)
         colorful_print(
             f"Initializing {total_trainers} trainers sequentially (each trainer spawns workers in parallel)...",
             "blue",
         )
 
-        for idx, (model_name, trainer) in enumerate(self.ppo_trainer_dict.items(), 1):
+        for idx, (model_name, backend) in enumerate(policy_backends.items(), 1):
             colorful_print(
                 f"[{idx}/{total_trainers}] Initializing workers for: {model_name}",
                 "blue",
             )
-            trainer.init_workers()
+            backend.init_workers()
             colorful_print(
                 f"✓ [{idx}/{total_trainers}] Successfully initialized: {model_name}",
                 "green",
@@ -157,15 +189,12 @@ class PolicyTrainerRegistry:
         self.server_handle_dict = {}
         self.policy_server_name_mapping = {}
 
-        for model_name, trainer in self.ppo_trainer_dict.items():
-            self.async_rollout_manager_dict[model_name] = trainer.async_rollout_manager
-            self.checkpoint_manager_dict[model_name] = trainer.checkpoint_manager
-            self.tokenizer_dict[model_name] = trainer.tokenizer
-            server_handle_list = getattr(trainer.async_rollout_manager, "server_handles", [])
-            self.server_handle_dict[model_name] = server_handle_list
-            self.policy_server_name_mapping[model_name] = resolve_policy_server_name(
-                model_name, self.ppo_trainer_config_dict.get(model_name)
-            )
+        for model_name, backend in self._ensure_policy_backends().items():
+            self.async_rollout_manager_dict[model_name] = backend.async_rollout_manager
+            self.checkpoint_manager_dict[model_name] = backend.checkpoint_manager
+            self.tokenizer_dict[model_name] = backend.tokenizer
+            self.server_handle_dict[model_name] = backend.server_handles
+            self.policy_server_name_mapping[model_name] = backend.policy_server_name
 
     def get_async_rollout_managers(self):
         return self.async_rollout_manager_dict
@@ -181,3 +210,6 @@ class PolicyTrainerRegistry:
 
     def get_policy_server_names(self):
         return self.policy_server_name_mapping
+
+    def get_policy_backends(self):
+        return self._ensure_policy_backends()

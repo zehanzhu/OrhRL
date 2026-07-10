@@ -15,6 +15,7 @@ from verl.trainer.ppo.ray_trainer import (
 )
 
 from orchrl.trainer.mate.runtime import MateRuntime
+from orchrl.trainer.policy_backend import build_policy_backends_from_trainers
 from orchrl.trainer.policy_trainer_registry import PolicyTrainerRegistry
 from orchrl.trainer.training_step_executor import TrainingStepExecutor
 from orchrl.trainer.validation_runner import ValidationRunner
@@ -175,6 +176,19 @@ class MultiAgentsPPOTrainer:
             return {}
         return registry.get_policy_server_names()
 
+    def _get_policy_backends(self):
+        registry = getattr(self, "policy_trainer_registry", None)
+        get_policy_backends = (
+            getattr(registry, "get_policy_backends", None)
+            if registry is not None
+            else None
+        )
+        if callable(get_policy_backends):
+            policy_backends = get_policy_backends()
+            if isinstance(policy_backends, dict):
+                return policy_backends
+        return build_policy_backends_from_trainers(self.ppo_trainer_dict)
+
     def _initialize_ppo_trainers(self):
         self.policy_trainer_registry.initialize_ppo_trainers()
 
@@ -261,10 +275,10 @@ class MultiAgentsPPOTrainer:
     def _restore_global_steps_from_checkpoints(self) -> int:
         resolved_steps = {}
 
-        for model_name, trainer in self.ppo_trainer_dict.items():
-            loaded_step = trainer._load_checkpoint()
+        for model_name, policy_backend in self._get_policy_backends().items():
+            loaded_step = policy_backend.load_checkpoint()
             resolved_steps[model_name] = self._resolve_loaded_checkpoint_step(
-                trainer, loaded_step
+                policy_backend, loaded_step
             )
 
         resumed_steps = {
@@ -300,8 +314,8 @@ class MultiAgentsPPOTrainer:
         # Load checkpoint if resume is enabled
         # This must be done after init_workers() and before training loop
         self.global_steps = self._restore_global_steps_from_checkpoints()
-        for trainer in self.ppo_trainer_dict.values():
-            trainer.global_steps = self.global_steps
+        for policy_backend in self._get_policy_backends().values():
+            policy_backend.global_steps = self.global_steps
 
         self.total_training_steps = self.config.training.total_training_steps
         progress_bar = tqdm(range(self.total_training_steps), desc="Training Progress", position=0, leave=True)
@@ -331,7 +345,11 @@ class MultiAgentsPPOTrainer:
             for model_name, batch in batch_per_trainer.items():
                 if not self._has_real_batch(batch):
                     continue
-                for metric_name, metric_value in compute_data_metrics(batch=batch, use_critic=any(trainer.use_critic for trainer in self.ppo_trainer_dict.values())).items():
+                use_critic = any(
+                    policy_backend.uses_critic()
+                    for policy_backend in self._get_policy_backends().values()
+                )
+                for metric_name, metric_value in compute_data_metrics(batch=batch, use_critic=use_critic).items():
                     metric_name_policy= model_name + "_" + metric_name
                     metrics[metric_name_policy] = metric_value
 
@@ -350,8 +368,8 @@ class MultiAgentsPPOTrainer:
                 val_metrics = self._validate(global_steps=self.global_steps)
                 metrics.update(val_metrics)
             self.global_steps += 1
-            for ppo_trainer in self.ppo_trainer_dict.values():
-                ppo_trainer.global_steps = self.global_steps
+            for policy_backend in self._get_policy_backends().values():
+                policy_backend.global_steps = self.global_steps
             try:
                 logger.log(data=metrics, step=self.global_steps)
             except Exception as e:
@@ -411,14 +429,13 @@ class MultiAgentsPPOTrainer:
                 ):
                     colorful_print("Cleaned up MATE monitor pool", "yellow")
 
-            # Clean up PPO trainers
-            if hasattr(self, 'ppo_trainer_dict'):
-                colorful_print(f"Cleaning up {len(self.ppo_trainer_dict)} PPO trainers...", "yellow")
-                for model_name, trainer in self.ppo_trainer_dict.items():
+            # Clean up policy backends
+            policy_backends = self._get_policy_backends()
+            if policy_backends:
+                colorful_print(f"Cleaning up {len(policy_backends)} policy backends...", "yellow")
+                for model_name, policy_backend in policy_backends.items():
                     try:
-                        # Call the trainer's cleanup method
-                        if hasattr(trainer, 'cleanup'):
-                            trainer.cleanup()
+                        policy_backend.cleanup()
                         colorful_print(f"Cleaned up trainer for model: {model_name}", "yellow")
                     except Exception as e:
                         colorful_print(f"Error cleaning up trainer for {model_name}: {e}", "red")

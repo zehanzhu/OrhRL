@@ -22,6 +22,7 @@ from orchrl.trainer.mate.dataproto_adapter import (
 )
 from orchrl.trainer.mate.mas_metrics import build_mas_metrics
 from orchrl.trainer.mate.trajectory_export import maybe_export_prompt_trajectories
+from orchrl.trainer.policy_backend import build_policy_backends_from_trainers
 from orchrl.utils.performance import colorful_print, simple_timer
 
 @dataclass
@@ -56,10 +57,53 @@ class TrainingStepExecutor:
         }
         self._last_mate_episodes = []
 
-    def collect_mate_episodes(self, step_idx: int):
+    def _get_policy_backends(self):
+        get_policy_backends = getattr(
+            self.policy_trainer_registry,
+            "get_policy_backends",
+            None,
+        )
+        if callable(get_policy_backends):
+            policy_backends = get_policy_backends()
+            if isinstance(policy_backends, dict):
+                return policy_backends
+        return build_policy_backends_from_trainers(
+            getattr(self.policy_trainer_registry, "ppo_trainer_dict", {})
+        )
+
+    def _get_native_policy_backends(self):
+        get_policy_backends = getattr(
+            self.policy_trainer_registry,
+            "get_policy_backends",
+            None,
+        )
+        if not callable(get_policy_backends):
+            return None
+        policy_backends = get_policy_backends()
+        return policy_backends if isinstance(policy_backends, dict) else None
+
+    def _update_rollout_weights(self):
+        policy_backends = self._get_native_policy_backends()
+        if policy_backends is not None:
+            for policy_backend in policy_backends.values():
+                policy_backend.update_rollout_weights()
+            return
         checkpoint_managers = self.policy_trainer_registry.get_checkpoint_managers()
         for checkpoint_manager in checkpoint_managers.values():
             checkpoint_manager.update_weights()
+
+    def _sleep_rollout_replicas(self):
+        policy_backends = self._get_native_policy_backends()
+        if policy_backends is not None:
+            for policy_backend in policy_backends.values():
+                policy_backend.sleep_rollout_replicas()
+            return
+        checkpoint_managers = self.policy_trainer_registry.get_checkpoint_managers()
+        for checkpoint_manager in checkpoint_managers.values():
+            checkpoint_manager.sleep_replicas()
+
+    def collect_mate_episodes(self, step_idx: int):
+        self._update_rollout_weights()
         try:
             return asyncio.run(
                 self.mate_runtime.mate_rollout_adapter.collect_step_rollouts(
@@ -67,8 +111,7 @@ class TrainingStepExecutor:
                 )
             )
         finally:
-            for checkpoint_manager in checkpoint_managers.values():
-                checkpoint_manager.sleep_replicas()
+            self._sleep_rollout_replicas()
 
     def collect_mate_step_batches(self, step_idx: int):
         rollout_result = self.collect_mate_episodes(step_idx=step_idx)
@@ -100,11 +143,10 @@ class TrainingStepExecutor:
             "max_response_length",
             None,
         )
-        ppo_trainer_dict = self.policy_trainer_registry.ppo_trainer_dict
         if max_prompt_length is None:
-            max_prompt_length = next(iter(ppo_trainer_dict.values())).config.data.max_prompt_length
+            max_prompt_length = next(iter(self._get_policy_backends().values())).config.data.max_prompt_length
         if max_response_length is None:
-            max_response_length = next(iter(ppo_trainer_dict.values())).config.data.max_response_length
+            max_response_length = next(iter(self._get_policy_backends().values())).config.data.max_response_length
 
         role_names = (
             list(self.agent_policy_mapping.keys())
@@ -250,7 +292,7 @@ class TrainingStepExecutor:
         return uids, uids, False
 
     def resolve_mate_policy_batches(self, gen_batch_output_per_policy):
-        expected_policy_names = list(self.policy_trainer_registry.ppo_trainer_dict.keys())
+        expected_policy_names = list(self._get_policy_backends().keys())
         actual_policy_names = list(gen_batch_output_per_policy.keys())
         if not actual_policy_names:
             raise RuntimeError(
@@ -286,6 +328,7 @@ class TrainingStepExecutor:
         missing_policy_names = []
         metrics = {}
         timing_raw = {}
+        policy_backends = self._get_policy_backends()
 
         with simple_timer("collect_trajectory", timing_raw):
             gen_batch_output_per_policy = self.collect_mate_step_batches(step_idx=step_idx)
@@ -323,8 +366,8 @@ class TrainingStepExecutor:
                 )
 
             for model_name in present_policy_names:
-                trainer = self.policy_trainer_registry.ppo_trainer_dict[model_name]
-                dp_world_size = trainer.actor_rollout_wg.world_size
+                policy_backend = policy_backends[model_name]
+                dp_world_size = policy_backend.data_parallel_world_size()
                 batch_per_trainer_temp, _ = pad_dataproto_to_divisor(
                     gen_batch_output_per_policy[model_name],
                     dp_world_size,
@@ -340,12 +383,12 @@ class TrainingStepExecutor:
         update_timing_raw = {}
         with simple_timer("update_parameters", update_timing_raw):
             for model_name in present_policy_names:
-                trainer = self.policy_trainer_registry.ppo_trainer_dict[model_name]
+                policy_backend = policy_backends[model_name]
                 if model_name in batch_per_trainer and self.has_real_batch(
                     batch_per_trainer[model_name]
                 ):
-                    filter_ratio = getattr(trainer.config, "filter_ratio", 0.0)
-                    filter_method = getattr(trainer.config, "filter_method", "uid")
+                    filter_ratio = getattr(policy_backend.config, "filter_ratio", 0.0)
+                    filter_method = getattr(policy_backend.config, "filter_method", "uid")
                     batch_per_trainer[model_name] = self.filter_batch_by_existing_uid_groups(
                         batch_per_trainer[model_name],
                         filter_ratio=filter_ratio,
@@ -353,11 +396,11 @@ class TrainingStepExecutor:
                     )
 
             for model_name in present_policy_names:
-                trainer = self.policy_trainer_registry.ppo_trainer_dict[model_name]
+                policy_backend = policy_backends[model_name]
                 local_timing_raw = {}
                 updated_batch = self.update_parameters(
                     batch_per_trainer[model_name],
-                    trainer,
+                    policy_backend,
                     local_timing_raw,
                 )
 
@@ -377,7 +420,7 @@ class TrainingStepExecutor:
             timing_raw=timing_raw,
         )
 
-    def update_parameters(self, batch, ppo_trainer, timing_raw):
+    def update_parameters(self, batch, policy_backend, timing_raw):
         if not hasattr(batch, "meta_info"):
             batch.meta_info = {}
         if "metrics" not in batch.meta_info:
@@ -411,12 +454,12 @@ class TrainingStepExecutor:
         prompts_batch = torch.nn.utils.rnn.pad_sequence(
             [torch.flip(i, dims=[0]) for i in batch.batch["prompts"]],
             batch_first=True,
-            padding_value=ppo_trainer.tokenizer.pad_token_id,
+            padding_value=policy_backend.tokenizer.pad_token_id,
         ).flip(dims=[1])
         responses_batch = torch.nn.utils.rnn.pad_sequence(
             [i for i in batch.batch["responses"]],
             batch_first=True,
-            padding_value=ppo_trainer.tokenizer.pad_token_id,
+            padding_value=policy_backend.tokenizer.pad_token_id,
         )
         if "response_mask" in batch.batch.keys():
             response_mask_batch = torch.nn.utils.rnn.pad_sequence(
@@ -429,26 +472,26 @@ class TrainingStepExecutor:
 
         prompts_batch = pad_sequence_to_length(
             prompts_batch,
-            ppo_trainer.config.data.max_prompt_length,
-            ppo_trainer.tokenizer.pad_token_id,
+            policy_backend.config.data.max_prompt_length,
+            policy_backend.tokenizer.pad_token_id,
             left_pad=True,
         )
         responses_batch = pad_sequence_to_length(
             responses_batch,
-            ppo_trainer.config.data.max_response_length,
-            ppo_trainer.tokenizer.pad_token_id,
+            policy_backend.config.data.max_response_length,
+            policy_backend.tokenizer.pad_token_id,
             left_pad=False,
         )
         if response_mask_batch is not None:
             response_mask_batch = pad_sequence_to_length(
                 response_mask_batch,
-                ppo_trainer.config.data.max_response_length,
+                policy_backend.config.data.max_response_length,
                 0,
                 left_pad=False,
             )
         input_ids_batch = torch.cat([prompts_batch, responses_batch], dim=1)
         attention_mask_batch = torch.where(
-            input_ids_batch != ppo_trainer.tokenizer.pad_token_id,
+            input_ids_batch != policy_backend.tokenizer.pad_token_id,
             1,
             0,
         )
@@ -463,7 +506,7 @@ class TrainingStepExecutor:
         batch.batch["position_ids"] = position_ids
         if response_mask_batch is None:
             response_mask_batch = (
-                responses_batch != ppo_trainer.tokenizer.pad_token_id
+                responses_batch != policy_backend.tokenizer.pad_token_id
             ).to(attention_mask_batch.dtype)
         batch.batch["response_mask"] = response_mask_batch
         batch.meta_info["global_token_num"] = torch.sum(
@@ -476,7 +519,7 @@ class TrainingStepExecutor:
             dtype=torch.float32,
         )
         response_attention_mask = (
-            responses_batch != ppo_trainer.tokenizer.pad_token_id
+            responses_batch != policy_backend.tokenizer.pad_token_id
         )
         valid_token_counts = response_attention_mask.sum(dim=-1)
         valid_sequences_mask = valid_token_counts > 0
@@ -495,48 +538,38 @@ class TrainingStepExecutor:
         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
         with simple_timer("old_log_prob", timing_raw):
-            try:
-                dp_world_size = ppo_trainer.actor_rollout_wg.world_size
-            except Exception:
-                dp_world_size = 1
+            dp_world_size = policy_backend.data_parallel_world_size()
             if dp_world_size > 1:
                 batch, _ = pad_dataproto_to_divisor(batch, dp_world_size)
-            old_log_prob = ppo_trainer.actor_rollout_wg.compute_log_prob(batch)
+            old_log_prob = policy_backend.compute_old_log_prob(batch)
             batch = batch.union(old_log_prob)
 
-        need_ref_log_prob = (
-            ppo_trainer.use_reference_policy
-            or ppo_trainer.config.algorithm.use_kl_in_reward
-        )
-        if need_ref_log_prob:
+        if policy_backend.needs_ref_log_prob():
             with simple_timer("ref", timing_raw):
-                if not ppo_trainer.ref_in_actor:
-                    ref_log_prob = ppo_trainer.ref_policy_wg.compute_ref_log_prob(batch)
-                else:
-                    ref_log_prob = ppo_trainer.actor_rollout_wg.compute_ref_log_prob(batch)
+                ref_log_prob = policy_backend.compute_ref_log_prob(batch)
                 batch = batch.union(ref_log_prob)
 
-        if ppo_trainer.use_critic:
+        if policy_backend.uses_critic():
             with simple_timer("values", timing_raw):
-                values = ppo_trainer.critic_wg.compute_values(batch)
+                values = policy_backend.compute_values(batch)
                 batch = batch.union(values)
 
-        if ppo_trainer.config.algorithm.use_kl_in_reward:
+        if policy_backend.config.algorithm.use_kl_in_reward:
             with simple_timer("kl_penalty", timing_raw):
-                if not hasattr(ppo_trainer, "kl_ctrl_in_reward"):
-                    ppo_trainer.kl_ctrl_in_reward = core_algos.get_kl_controller(
-                        ppo_trainer.config.algorithm.kl_ctrl
+                if not hasattr(policy_backend, "kl_ctrl_in_reward"):
+                    policy_backend.kl_ctrl_in_reward = core_algos.get_kl_controller(
+                        policy_backend.config.algorithm.kl_ctrl
                     )
                 batch, kl_metrics = apply_kl_penalty(
                     batch,
-                    kl_ctrl=ppo_trainer.kl_ctrl_in_reward,
-                    kl_penalty=ppo_trainer.config.algorithm.kl_penalty,
+                    kl_ctrl=policy_backend.kl_ctrl_in_reward,
+                    kl_penalty=policy_backend.config.algorithm.kl_penalty,
                 )
                 batch.meta_info["metrics"].update(kl_metrics)
                 colorful_print(f"Applied KL penalty: {kl_metrics}", "cyan")
 
         with simple_timer("adv", timing_raw):
-            norm_adv_by_std_in_grpo = ppo_trainer.config.algorithm.get(
+            norm_adv_by_std_in_grpo = policy_backend.config.algorithm.get(
                 "norm_adv_by_std_in_grpo",
                 True,
             )
@@ -546,40 +579,40 @@ class TrainingStepExecutor:
             try:
                 batch = compute_advantage(
                     batch,
-                    adv_estimator=ppo_trainer.config.algorithm.adv_estimator,
-                    gamma=ppo_trainer.config.algorithm.gamma,
-                    lam=ppo_trainer.config.algorithm.lam,
-                    num_repeat=ppo_trainer.config.actor_rollout_ref.rollout.n,
+                    adv_estimator=policy_backend.config.algorithm.adv_estimator,
+                    gamma=policy_backend.config.algorithm.gamma,
+                    lam=policy_backend.config.algorithm.lam,
+                    num_repeat=policy_backend.config.actor_rollout_ref.rollout.n,
                     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                    config=ppo_trainer.config.algorithm,
+                    config=policy_backend.config.algorithm,
                 )
             finally:
                 batch.non_tensor_batch["uid"] = np.array(original_uids, dtype=object)
 
-        if ppo_trainer.use_critic:
+        if policy_backend.uses_critic():
             with simple_timer("update_critic", timing_raw):
-                critic_output = ppo_trainer.critic_wg.update_critic(batch)
+                critic_output = policy_backend.update_critic(batch)
             critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
             batch.meta_info["metrics"].update(critic_output_metrics)
 
         with simple_timer("update_actor", timing_raw):
             batch.meta_info["multi_turn"] = (
-                ppo_trainer.config.actor_rollout_ref.rollout.multi_turn.enable
+                policy_backend.config.actor_rollout_ref.rollout.multi_turn.enable
             )
-            actor_output = ppo_trainer.actor_rollout_wg.update_actor(batch)
+            actor_output = policy_backend.update_actor(batch)
             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
 
             batch.meta_info["metrics"].update(actor_output_metrics)
 
-        rollout_data_dir = ppo_trainer.config.trainer.get("rollout_data_dir", None)
+        rollout_data_dir = policy_backend.config.trainer.get("rollout_data_dir", None)
         if rollout_data_dir:
             with simple_timer("dump_rollout_generations", timing_raw):
                 reward_extra_infos_dict: dict[str, list] = {}
-                inputs = ppo_trainer.tokenizer.batch_decode(
+                inputs = policy_backend.tokenizer.batch_decode(
                     batch.batch["prompts"],
                     skip_special_tokens=True,
                 )
-                outputs = ppo_trainer.tokenizer.batch_decode(
+                outputs = policy_backend.tokenizer.batch_decode(
                     batch.batch["responses"],
                     skip_special_tokens=True,
                 )
@@ -589,7 +622,7 @@ class TrainingStepExecutor:
                         "request_id",
                         batch.non_tensor_batch["request_id"].tolist(),
                     )
-                ppo_trainer._dump_generations(
+                policy_backend.dump_generations(
                     inputs=inputs,
                     outputs=outputs,
                     scores=scores,

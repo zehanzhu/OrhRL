@@ -278,6 +278,10 @@ class PolicyTrainerRegistryBehaviorTests(unittest.TestCase):
             registry.get_server_handles(),
             {"policy_a": ["tok-a-handle"], "policy_b": ["tok-b-handle"]},
         )
+        policy_backends = registry.get_policy_backends()
+        self.assertEqual(set(policy_backends.keys()), {"policy_a", "policy_b"})
+        self.assertIs(policy_backends["policy_a"].trainer, registry.ppo_trainer_dict["policy_a"])
+        self.assertEqual(policy_backends["policy_a"].policy_server_name, "served-policy-a")
         self.assertEqual(
             registry.get_policy_server_names(),
             {"policy_a": "served-policy-a", "policy_b": "model-b"},
@@ -490,9 +494,17 @@ class TrainConfigNormalizationTests(unittest.TestCase):
         fake_remote_worker = object()
 
         class _FakeResourcePoolManager:
-            def __init__(self, resource_pool_spec, mapping):
+            def __init__(
+                self,
+                resource_pool_spec,
+                mapping,
+                bundle_resources=None,
+                n_gpus_per_node=None,
+            ):
                 self.resource_pool_spec = resource_pool_spec
                 self.mapping = mapping
+                self.bundle_resources = bundle_resources
+                self.n_gpus_per_node = n_gpus_per_node
 
             def create_resource_pool(self):
                 return None
@@ -1417,11 +1429,11 @@ class TrainingStepExecutorBehaviorTests(unittest.TestCase):
         self.assertEqual(result.metrics["mas/train/sample_avg_reward"], 0.5)
         self.assertEqual(result.metrics["mas/train/success_rate"], 0.5)
         self.assertEqual(result.metrics["mas/train/failed_rate"], 0.5)
-        executor.update_parameters.assert_called_once_with(
-            fake_batch,
-            trainer_a,
-            mock.ANY,
-        )
+        executor.update_parameters.assert_called_once()
+        update_args = executor.update_parameters.call_args.args
+        self.assertEqual(update_args[0], fake_batch)
+        self.assertIs(update_args[1].trainer, trainer_a)
+        self.assertIsInstance(update_args[2], dict)
         self.assertIn("collect_trajectory", result.timing_raw)
         self.assertIn("update_parameters", result.timing_raw)
 

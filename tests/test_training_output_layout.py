@@ -83,10 +83,8 @@ class TrainingOutputLayoutTests(unittest.TestCase):
             repo_root / "orchrl/trainer/multi_agents_ppo_trainer.py"
         ).read_text(encoding="utf-8")
 
-        self.assertIn(
-            'log_dir = os.path.join("outputs", "logs", experiment_name, date_str, time_str)',
-            trainer_text,
-        )
+        self.assertIn('run_dir_path / "logs" / date_str / time_str', trainer_text)
+        self.assertIn('Path.cwd() / "outputs" / "logs" / experiment_name', trainer_text)
 
 
     def test_trainer_references_refactor_collaborators(self):

@@ -12,6 +12,7 @@ from orchrl.trainer.mate.mas_metrics import (
     finalize_mas_metrics,
     init_mas_metric_stats,
 )
+from orchrl.trainer.policy_backend import build_policy_backends_from_trainers
 from orchrl.utils.performance import colorful_print
 
 
@@ -30,6 +31,51 @@ class ValidationRunner:
         self.agent_policy_mapping = agent_policy_mapping or {}
         self.best_validation_reward = float("-inf")
 
+    def _get_policy_backends(self):
+        get_policy_backends = getattr(
+            self.policy_trainer_registry,
+            "get_policy_backends",
+            None,
+        )
+        if callable(get_policy_backends):
+            policy_backends = get_policy_backends()
+            if isinstance(policy_backends, dict):
+                return policy_backends
+        return build_policy_backends_from_trainers(
+            getattr(self.policy_trainer_registry, "ppo_trainer_dict", {})
+        )
+
+    def _get_native_policy_backends(self):
+        get_policy_backends = getattr(
+            self.policy_trainer_registry,
+            "get_policy_backends",
+            None,
+        )
+        if not callable(get_policy_backends):
+            return None
+        policy_backends = get_policy_backends()
+        return policy_backends if isinstance(policy_backends, dict) else None
+
+    def _update_rollout_weights(self):
+        policy_backends = self._get_native_policy_backends()
+        if policy_backends is not None:
+            for policy_backend in policy_backends.values():
+                policy_backend.update_rollout_weights()
+            return
+        checkpoint_managers = self.policy_trainer_registry.get_checkpoint_managers()
+        for checkpoint_manager in checkpoint_managers.values():
+            checkpoint_manager.update_weights()
+
+    def _sleep_rollout_replicas(self):
+        policy_backends = self._get_native_policy_backends()
+        if policy_backends is not None:
+            for policy_backend in policy_backends.values():
+                policy_backend.sleep_rollout_replicas()
+            return
+        checkpoint_managers = self.policy_trainer_registry.get_checkpoint_managers()
+        for checkpoint_manager in checkpoint_managers.values():
+            checkpoint_manager.sleep_replicas()
+
     def iter_validation_episode_batches(self):
         validate_batch_size = int(
             getattr(
@@ -41,9 +87,7 @@ class ValidationRunner:
         if validate_batch_size < 1:
             raise ValueError("training.validate_batch_size must be >= 1")
 
-        checkpoint_managers = self.policy_trainer_registry.get_checkpoint_managers()
-        for checkpoint_manager in checkpoint_managers.values():
-            checkpoint_manager.update_weights()
+        self._update_rollout_weights()
 
         try:
             for prompt_batch in self.mate_runtime.mate_val_prompt_loader.iter_batches(
@@ -56,8 +100,7 @@ class ValidationRunner:
                     )
                 )
         finally:
-            for checkpoint_manager in checkpoint_managers.values():
-                checkpoint_manager.sleep_replicas()
+            self._sleep_rollout_replicas()
 
     @staticmethod
     def init_validation_stats():
@@ -158,11 +201,11 @@ class ValidationRunner:
 
         spec = validate_specialization_mode(self.config.specialization)
         save_jobs = []
-        ppo_trainer_dict = self.policy_trainer_registry.ppo_trainer_dict
+        policy_backends = self._get_policy_backends()
 
         if spec == ROLE_SHARING:
-            for trainer in ppo_trainer_dict.values():
-                save_jobs.append(("shared_model", trainer))
+            for policy_backend in policy_backends.values():
+                save_jobs.append(("shared_model", policy_backend))
         elif spec == ROLE_SPECIFIC:
             num_base_models = (
                 len(self.config.base_models)
@@ -171,14 +214,14 @@ class ValidationRunner:
             )
             if num_base_models == 1:
                 for agent_name, policy_name in self.agent_policy_mapping.items():
-                    trainer = ppo_trainer_dict[policy_name]
-                    save_jobs.append((agent_name, trainer))
+                    policy_backend = policy_backends[policy_name]
+                    save_jobs.append((agent_name, policy_backend))
             else:
-                for model_name, trainer in ppo_trainer_dict.items():
-                    save_jobs.append((model_name, trainer))
+                for model_name, policy_backend in policy_backends.items():
+                    save_jobs.append((model_name, policy_backend))
 
-        for _, trainer in save_jobs:
-            trainer._save_checkpoint()
+        for _, policy_backend in save_jobs:
+            policy_backend.save_checkpoint()
 
     def validate(self, global_steps=0):
         stats = self.init_validation_stats()
