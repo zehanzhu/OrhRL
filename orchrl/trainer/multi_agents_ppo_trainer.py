@@ -17,6 +17,7 @@ from verl.trainer.ppo.ray_trainer import (
 from orchrl.trainer.mate.runtime import MateRuntime
 from orchrl.trainer.policy_trainer_registry import PolicyTrainerRegistry
 from orchrl.trainer.training_step_executor import TrainingStepExecutor
+from orchrl.trainer.v1_tq_adapter import is_v1_tq_backend
 from orchrl.trainer.validation_runner import ValidationRunner
 from orchrl.utils.clean_up import cleanup_old_image_folders, run_async_cleanup
 from orchrl.utils.performance import simple_timer, colorful_print
@@ -44,6 +45,7 @@ class MultiAgentsPPOTrainer:
         self.agent_policy_mapping = agent_policy_mapping
         self.training_step_executor = None
         self.validation_runner = None
+        self.use_v1_tq_backend = is_v1_tq_backend(config)
 
         self.agent_untrained = []
         if hasattr(config, 'multi_agent_interaction') and hasattr(config.multi_agent_interaction, 'agent_untrained'):
@@ -56,6 +58,11 @@ class MultiAgentsPPOTrainer:
             role_worker_mapping=self.role_worker_mapping,
             resource_pool_manager=self.resource_pool_manager,
             ray_worker_group_cls=self.ray_worker_group_cls,
+            trainer_backend=getattr(
+                getattr(self.config, "training", None),
+                "ppo_backend",
+                None,
+            ),
         )
         self.mate_runtime = MateRuntime(
             config=self.config,
@@ -234,7 +241,8 @@ class MultiAgentsPPOTrainer:
                 run_dir_path = Path.cwd() / run_dir_path
             log_dir = run_dir_path / "logs" / date_str / time_str
         else:
-            log_dir = (Path.cwd() / "outputs" / "logs" / experiment_name / date_str / time_str)
+            log_dir = os.path.join("outputs", "logs", experiment_name, date_str, time_str)
+            log_dir = Path.cwd() / log_dir
 
         log_dir = log_dir.resolve()
         os.makedirs(log_dir, exist_ok=True)
@@ -262,7 +270,10 @@ class MultiAgentsPPOTrainer:
         resolved_steps = {}
 
         for model_name, trainer in self.ppo_trainer_dict.items():
-            loaded_step = trainer._load_checkpoint()
+            if getattr(self, "use_v1_tq_backend", False):
+                loaded_step = getattr(trainer, "global_steps", 0)
+            else:
+                loaded_step = trainer._load_checkpoint()
             resolved_steps[model_name] = self._resolve_loaded_checkpoint_step(
                 trainer, loaded_step
             )
@@ -295,6 +306,9 @@ class MultiAgentsPPOTrainer:
         """
         The training loop of PPO. Adapted to train the underlying model of agent.
         """
+        if getattr(self, "use_v1_tq_backend", False):
+            return self._fit_v1_tq()
+
         logger = self._initialize_logger_safely()
 
         # Load checkpoint if resume is enabled
@@ -387,6 +401,57 @@ class MultiAgentsPPOTrainer:
 
                 # perform final validation and print summary
 
+                return
+
+        progress_bar.close()
+
+    def _fit_v1_tq(self):
+        logger = self._initialize_logger_safely()
+
+        self.global_steps = self._restore_global_steps_from_checkpoints()
+        self.total_training_steps = self.config.training.total_training_steps
+        progress_bar = tqdm(
+            range(self.total_training_steps),
+            desc="Training Progress",
+            position=0,
+            leave=True,
+        )
+
+        while self.global_steps < self.total_training_steps:
+            progress_bar.update(1)
+            progress_bar.set_description(f"Step {self.global_steps}")
+            pprint(f"step {self.global_steps} started")
+
+            metrics = {}
+            timing_raw = {}
+            with simple_timer("step", timing_raw):
+                step_result = self.training_step_executor.execute_v1_tq_training_step(
+                    step_idx=self.global_steps
+                )
+                metrics.update(step_result.metrics)
+                timing_raw = step_result.timing_raw
+
+            metrics.update({"training/global_step": self.global_steps})
+
+            if self.global_steps % self.config.training.val_freq == 0 and self.global_steps != 0:
+                val_metrics = self._validate(global_steps=self.global_steps)
+                metrics.update(val_metrics)
+
+            self.global_steps += 1
+            for ppo_trainer in self.ppo_trainer_dict.values():
+                ppo_trainer.global_steps = self.global_steps
+
+            try:
+                logger.log(data=metrics, step=self.global_steps)
+            except Exception as e:
+                pprint(f"Warning: Failed to log metrics to logger: {type(e).__name__}: {e}")
+                pprint(f"Metrics that failed to log: {list(metrics.keys())}")
+
+            if self.global_steps >= self.total_training_steps:
+                progress_bar.close()
+                for trainer in self.ppo_trainer_dict.values():
+                    if hasattr(trainer, "_shutdown_dump_executor"):
+                        trainer._shutdown_dump_executor()
                 return
 
         progress_bar.close()

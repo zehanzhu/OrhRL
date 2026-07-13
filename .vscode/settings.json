@@ -1,0 +1,22 @@
+{
+    "python.defaultInterpreterPath": "/mnt/bn/chenghao1026-lq/resouces/libs/zzh_env/bin/python",
+    "python.analysis.extraPaths": [
+        "/mnt/bn/chenghao1026-lq/zzh/zzh_0713/OrchRL",
+        "/mnt/bn/chenghao1026-lq/zzh/zzh_0713/verl"
+    ],
+    "python.analysis.autoSearchPaths": true,
+    "python.analysis.indexing": true,
+    "python.analysis.diagnosticMode": "workspace",
+    "python.envFile": "${workspaceFolder}/.vscode/python.env",
+    "terminal.integrated.env.linux": {
+        "MAMBA_ROOT_PREFIX": "/mnt/bn/chenghao1026-lq/resouces/libs/micromamba_root",
+        "CONDA_PREFIX": "/mnt/bn/chenghao1026-lq/resouces/libs/zzh_env",
+        "CONDA_DEFAULT_ENV": "zzh_env",
+        "ORCHRL_CACHE_ROOT": "/tmp/orchrl-cache",
+        "FLASHINFER_WORKSPACE_BASE": "/tmp/orchrl-cache",
+        "FLASHINFER_WORKSPACE_DIR": "/tmp/orchrl-cache/flashinfer",
+        "TRITON_CACHE_DIR": "/tmp/orchrl-cache/triton",
+        "PATH": "/mnt/bn/chenghao1026-lq/resouces/libs/zzh_env/bin:${env:PATH}",
+        "PYTHONPATH": "/mnt/bn/chenghao1026-lq/zzh/zzh_0713/OrchRL:/mnt/bn/chenghao1026-lq/zzh/zzh_0713/verl:${env:PYTHONPATH}"
+    }
+}

@@ -119,6 +119,22 @@ class PolicyTrainerRegistryBehaviorTests(unittest.TestCase):
         def init_workers(self):
             self.init_workers_calls += 1
 
+    class _FakeV1PPOTrainer:
+        def __init__(self, *, config):
+            self.config = config
+            self.tokenizer = f"{config.actor_rollout_ref.model.path}-tok"
+            self.llm_server_manager = SimpleNamespace(
+                server_handles=[f"{config.actor_rollout_ref.model.path}-handle"],
+                server_addresses=[f"{config.actor_rollout_ref.model.path}:8000"],
+                global_load_balancer=f"{config.actor_rollout_ref.model.path}-lb",
+            )
+            self.checkpoint_manager = f"{config.actor_rollout_ref.model.path}-ckpt"
+            self.global_steps = None
+            self.init_calls = 0
+
+        def init(self):
+            self.init_calls += 1
+
     def _build_config(self, specialization: str):
         return OmegaConf.create(
             {
@@ -298,6 +314,37 @@ class PolicyTrainerRegistryBehaviorTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "role_sharing"):
             registry.initialize_ppo_trainers()
+
+    def test_registry_can_create_v1_transfer_queue_trainers(self):
+        from orchrl.trainer.policy_trainer_registry import PolicyTrainerRegistry
+
+        config = self._build_config("role_specific")
+        config.training.ppo_backend = "v1_tq"
+        registry = PolicyTrainerRegistry(
+            config=config,
+            tokenizer_dict={},
+            role_worker_mapping={},
+            resource_pool_manager=[],
+            ray_worker_group_cls=object,
+            ppo_trainer_cls=self._FakeV1PPOTrainer,
+            trainer_backend="v1_tq",
+        )
+
+        registry.initialize_ppo_trainers()
+        registry.init_workers()
+        registry.collect_runtime_handles()
+
+        self.assertEqual(set(registry.ppo_trainer_dict.keys()), {"policy_a", "policy_b"})
+        for trainer in registry.ppo_trainer_dict.values():
+            self.assertEqual(trainer.init_calls, 1)
+            self.assertTrue(trainer.config.trainer.use_v1)
+            self.assertTrue(trainer.config.transfer_queue.enable)
+            self.assertEqual(trainer.global_steps, 0)
+
+        self.assertEqual(
+            registry.get_server_handles(),
+            {"policy_a": ["model-a-handle"], "policy_b": ["model-b-handle"]},
+        )
 
 
 class TrainConfigNormalizationTests(unittest.TestCase):

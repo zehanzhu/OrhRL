@@ -230,7 +230,7 @@ agents:
       base_url: http://127.0.0.1:8002/v1
   answerer:
     # 不配置 llm 时会继承顶层 llm 配置
-    temperature: 0.4
+    temperature: 0.6
 
 search:
   provider: http

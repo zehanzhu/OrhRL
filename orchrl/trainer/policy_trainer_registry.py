@@ -9,6 +9,11 @@ from orchrl.trainer.specialization_mode import (
     ROLE_SPECIFIC,
     validate_specialization_mode,
 )
+from orchrl.trainer.v1_tq_adapter import (
+    ensure_v1_ppo_config,
+    get_v1_trainer_cls,
+    is_v1_tq_backend,
+)
 from orchrl.utils.performance import colorful_print
 from orchrl.utils.served_model_name import resolve_policy_server_name
 
@@ -24,6 +29,7 @@ class PolicyTrainerRegistry:
         resource_pool_manager,
         ray_worker_group_cls,
         ppo_trainer_cls=RayPPOTrainer,
+        trainer_backend=None,
     ):
         self.config = config
         self.input_tokenizer_dict = tokenizer_dict
@@ -31,6 +37,7 @@ class PolicyTrainerRegistry:
         self.resource_pool_manager = resource_pool_manager
         self.ray_worker_group_cls = ray_worker_group_cls
         self.ppo_trainer_cls = ppo_trainer_cls
+        self.trainer_backend = trainer_backend
 
         self.ppo_trainer_config_dict = {}
         self.ppo_trainer_dict = {}
@@ -39,6 +46,46 @@ class PolicyTrainerRegistry:
         self.tokenizer_dict = {}
         self.server_handle_dict = {}
         self.policy_server_name_mapping = {}
+
+    def _uses_v1_tq_backend(self):
+        if self.trainer_backend is not None:
+            return str(self.trainer_backend).lower() in {
+                "v1",
+                "v1_tq",
+                "ppo_v1",
+                "ppo_v1_tq",
+                "transfer_queue",
+            }
+        return is_v1_tq_backend(self.config)
+
+    def _resolve_trainer_cls(self, ppo_config):
+        if self._uses_v1_tq_backend() and self.ppo_trainer_cls is RayPPOTrainer:
+            return get_v1_trainer_cls(ppo_config)
+        return self.ppo_trainer_cls
+
+    def _create_ppo_trainer(self, *, model_name, ppo_config, resource_pool_manager):
+        if self._uses_v1_tq_backend():
+            ensure_v1_ppo_config(ppo_config)
+            trainer_cls = self._resolve_trainer_cls(ppo_config)
+            ppo_trainer = trainer_cls(config=ppo_config)
+        else:
+            trainer_cls = self._resolve_trainer_cls(ppo_config)
+            ppo_trainer = trainer_cls(
+                config=ppo_config,
+                tokenizer=self.input_tokenizer_dict[model_name],
+                role_worker_mapping=self.role_worker_mapping,
+                resource_pool_manager=resource_pool_manager,
+                ray_worker_group_cls=self.ray_worker_group_cls,
+            )
+        ppo_trainer.global_steps = 0
+        return ppo_trainer
+
+    def _resource_pool_at(self, index: int):
+        if isinstance(self.resource_pool_manager, (list, tuple)):
+            if index < len(self.resource_pool_manager):
+                return self.resource_pool_manager[index]
+            return None
+        return self.resource_pool_manager
 
     def initialize_ppo_trainers(self):
         specialization = validate_specialization_mode(self.config.specialization)
@@ -81,14 +128,11 @@ class PolicyTrainerRegistry:
         if default_local_dir is not None:
             ppo_config.trainer.default_local_dir = default_local_dir
 
-        ppo_trainer = self.ppo_trainer_cls(
-            config=ppo_config,
-            tokenizer=self.input_tokenizer_dict[model_name],
-            role_worker_mapping=self.role_worker_mapping,
-            resource_pool_manager=self.resource_pool_manager[0],
-            ray_worker_group_cls=self.ray_worker_group_cls,
+        ppo_trainer = self._create_ppo_trainer(
+            model_name=model_name,
+            ppo_config=ppo_config,
+            resource_pool_manager=self._resource_pool_at(0),
         )
-        ppo_trainer.global_steps = 0
         self.ppo_trainer_dict[model_name] = ppo_trainer
 
     def create_multiple_ppo_trainers(self):
@@ -115,14 +159,11 @@ class PolicyTrainerRegistry:
             if default_local_dir is not None:
                 ppo_config.trainer.default_local_dir = default_local_dir
 
-            ppo_trainer = self.ppo_trainer_cls(
-                config=ppo_config,
-                tokenizer=self.input_tokenizer_dict[model_name],
-                role_worker_mapping=self.role_worker_mapping,
-                resource_pool_manager=self.resource_pool_manager[i],
-                ray_worker_group_cls=self.ray_worker_group_cls,
+            ppo_trainer = self._create_ppo_trainer(
+                model_name=model_name,
+                ppo_config=ppo_config,
+                resource_pool_manager=self._resource_pool_at(i),
             )
-            ppo_trainer.global_steps = 0
             self.ppo_trainer_dict[model_name] = ppo_trainer
 
     def init_workers(self):
@@ -142,7 +183,14 @@ class PolicyTrainerRegistry:
                 f"[{idx}/{total_trainers}] Initializing workers for: {model_name}",
                 "blue",
             )
-            trainer.init_workers()
+            if hasattr(trainer, "init_workers"):
+                trainer.init_workers()
+            elif hasattr(trainer, "init"):
+                trainer.init()
+            else:
+                raise AttributeError(
+                    f"PPO trainer for '{model_name}' has neither init_workers() nor init()"
+                )
             colorful_print(
                 f"✓ [{idx}/{total_trainers}] Successfully initialized: {model_name}",
                 "green",
@@ -158,10 +206,23 @@ class PolicyTrainerRegistry:
         self.policy_server_name_mapping = {}
 
         for model_name, trainer in self.ppo_trainer_dict.items():
-            self.async_rollout_manager_dict[model_name] = trainer.async_rollout_manager
-            self.checkpoint_manager_dict[model_name] = trainer.checkpoint_manager
-            self.tokenizer_dict[model_name] = trainer.tokenizer
-            server_handle_list = getattr(trainer.async_rollout_manager, "server_handles", [])
+            rollout_manager = getattr(
+                trainer,
+                "async_rollout_manager",
+                getattr(trainer, "llm_server_manager", None),
+            )
+            self.async_rollout_manager_dict[model_name] = rollout_manager
+            self.checkpoint_manager_dict[model_name] = getattr(
+                trainer,
+                "checkpoint_manager",
+                None,
+            )
+            self.tokenizer_dict[model_name] = getattr(
+                trainer,
+                "tokenizer",
+                self.input_tokenizer_dict.get(model_name),
+            )
+            server_handle_list = getattr(rollout_manager, "server_handles", [])
             self.server_handle_dict[model_name] = server_handle_list
             self.policy_server_name_mapping[model_name] = resolve_policy_server_name(
                 model_name, self.ppo_trainer_config_dict.get(model_name)

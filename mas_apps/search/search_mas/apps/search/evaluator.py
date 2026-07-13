@@ -62,7 +62,21 @@ def subem_check(prediction: str | None, golden_answers: Any) -> bool:
     return False
 
 
-def is_search_answer_correct(prediction: str | None, golden_answers: Any, use_substring: bool = False) -> bool:
+def is_search_answer_correct(
+    prediction: str | None,
+    golden_answers: Any,
+    use_substring: bool = False,
+    match_mode: str | None = None,
+) -> bool:
+    if match_mode is not None:
+        resolved_match_mode = str(match_mode).strip().lower()
+        if resolved_match_mode == "substring":
+            use_substring = True
+        elif resolved_match_mode == "exact":
+            use_substring = False
+        else:
+            raise ValueError(f"unsupported match_mode: {match_mode}")
+
     if use_substring:
         return subem_check(prediction, golden_answers)
     return em_check(prediction, golden_answers)

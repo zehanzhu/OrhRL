@@ -73,6 +73,7 @@ base_models:
     path: /mnt/bn/chenghao1026/models/Qwen3-8B
     name: answerer_model
 training:
+  ppo_backend: v1_tq
   rollout_source: mate
   device: cuda
   total_training_steps: 100

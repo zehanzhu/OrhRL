@@ -6,6 +6,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 import sys
 import os
 import logging
+import inspect
 
 # Configure unbuffered output for real-time logging
 os.environ['PYTHONUNBUFFERED'] = '1'
@@ -16,13 +17,19 @@ import hydra
 import ray
 from omegaconf import OmegaConf, DictConfig
 from verl.single_controller.ray import RayWorkerGroup
-from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker
+from verl.workers.engine_workers import ActorRolloutRefWorker
 
 from orchrl.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 from orchrl.trainer.specialization_mode import (
     ROLE_SHARING,
     ROLE_SPECIFIC,
     validate_specialization_mode,
+)
+from orchrl.trainer.v1_tq_adapter import (
+    close_transfer_queue_for_v1,
+    ensure_top_level_transfer_queue_config,
+    initialize_transfer_queue_for_v1,
+    is_v1_tq_backend,
 )
 from orchrl.utils.clean_up import cleanup_ray_runtime, install_cleanup_hooks
 from orchrl.utils.output_paths import prepare_training_output_dirs
@@ -65,7 +72,9 @@ def _patch_verl_reward_loop_for_external_mas(config: DictConfig) -> None:
         # OrchRL external MAS computes rewards via the MATE reward provider,
         # so VERL generic reward-loop workers are redundant here and clash
         # across multiple policy trainers because they use fixed Ray actor names.
-        self.reward_loop_workers = None
+        # V1 treats None as "compute colocated rewards now"; [] means external
+        # rewards have already been supplied through TransferQueue rm_scores.
+        self.reward_loop_workers = []
         return
 
     reward_loop_module.RewardLoopManager._orchrl_original_init_reward_loop_workers = (
@@ -89,6 +98,8 @@ def main(config: DictConfig):
 
 def run_ppo(config):
     try:
+        if is_v1_tq_backend(config):
+            ensure_top_level_transfer_queue_config(config)
         # Initialize Ray with temporary directories
         init_ray_with_temp_dirs(config)
 
@@ -131,6 +142,9 @@ def train_multi_agents(config):
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
     _patch_verl_reward_loop_for_external_mas(config)
+    v1_tq_enabled = is_v1_tq_backend(config)
+    if v1_tq_enabled:
+        initialize_transfer_queue_for_v1(config)
 
     agent_policy_mapping = {}
     for agent_config in config.agent_policy_configs.agent_configs.values():
@@ -189,7 +203,7 @@ def train_multi_agents(config):
         tokenizer_dict[model_name] = tokenizer
 
     role_worker_mapping = {
-        Role.ActorRolloutRef: ray.remote(max_concurrency=2048)(AsyncActorRolloutRefWorker),
+        Role.ActorRolloutRef: ray.remote(max_concurrency=2048)(ActorRolloutRefWorker),
     }
 
     managers = _build_policy_resource_pool_managers(config)
@@ -205,8 +219,12 @@ def train_multi_agents(config):
     trainer.init_workers()
     
     trainer.init_mate_rollout_runtime()
-    
-    trainer.fit()
+
+    try:
+        trainer.fit()
+    finally:
+        if v1_tq_enabled:
+            close_transfer_queue_for_v1()
 
 
 def _build_policy_resource_pool_managers(config):
@@ -233,15 +251,32 @@ def _build_policy_resource_pool_managers(config):
             Role.Critic: global_pool_id,
             Role.RefPolicy: global_pool_id,
         }
-        manager = ResourcePoolManager(
-            resource_pool_spec=resource_pool_spec,
-            mapping=mapping,
-            bundle_resources={global_pool_id: bundle_resources} if bundle_resources else {},
-            n_gpus_per_node=n_gpus_per_node,
-        )
+        manager_kwargs = {
+            "resource_pool_spec": resource_pool_spec,
+            "mapping": mapping,
+        }
+        if _supports_keyword(ResourcePoolManager, "bundle_resources"):
+            manager_kwargs["bundle_resources"] = (
+                {global_pool_id: bundle_resources} if bundle_resources else {}
+            )
+        if _supports_keyword(ResourcePoolManager, "n_gpus_per_node"):
+            manager_kwargs["n_gpus_per_node"] = n_gpus_per_node
+
+        manager = ResourcePoolManager(**manager_kwargs)
         managers.append(manager)
 
     return managers
+
+
+def _supports_keyword(callable_obj, keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def _expand_single_base_model_role_specific(

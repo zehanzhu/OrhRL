@@ -1,5 +1,13 @@
 # Monkey patch a few functions to avoid name collision with multi trainers. In the long run, these changes should be merged to verl.
 
+import os
+
+_ORCHRL_CACHE_ROOT = os.environ.get("ORCHRL_CACHE_ROOT", "/tmp/orchrl-cache")
+os.environ.setdefault("XDG_CACHE_HOME", _ORCHRL_CACHE_ROOT)
+os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", _ORCHRL_CACHE_ROOT)
+os.environ.setdefault("FLASHINFER_WORKSPACE_DIR", os.path.join(_ORCHRL_CACHE_ROOT, "flashinfer"))
+os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_ORCHRL_CACHE_ROOT, "triton"))
+
 from orchrl.verl_resource_pool_patch import patch_verl_resource_pool_manager
 from packaging import version
 from verl.workers.rollout.vllm_rollout.vllm_async_server import _VLLM_VERSION, vLLMReplica
@@ -11,6 +19,71 @@ from verl.utils.net_utils import is_valid_ipv6_address
 from verl.utils.device import get_resource_name
 
 patch_verl_resource_pool_manager()
+
+
+def _patch_async_llm_server_manager() -> None:
+    import uuid
+
+    import verl.experimental.agent_loop as agent_loop_module
+
+    if hasattr(agent_loop_module, "AsyncLLMServerManager"):
+        return
+
+    class AsyncLLMServerManager:
+        """Compatibility wrapper for VERL versions that no longer export this class."""
+
+        def __init__(self, config, servers, load_balancer_handle):
+            self.config = config
+            self._load_balancer = load_balancer_handle
+            self._server_id_to_handle = dict(servers)
+
+        async def _acquire_server(self, request_id):
+            result = await self._load_balancer.acquire_server.remote(request_id=request_id)
+            if isinstance(result, tuple) and len(result) == 2:
+                return result
+
+            server_id = result
+            handle = self._server_id_to_handle.get(server_id)
+            if handle is None:
+                raise RuntimeError(f"Unknown server_id returned by load balancer: {server_id}")
+            return server_id, handle
+
+        def _release_server(self, server_id):
+            self._load_balancer.release_server.remote(server_id=server_id)
+
+        async def generate(
+            self,
+            request_id,
+            *,
+            prompt_ids,
+            sampling_params,
+            image_data=None,
+            video_data=None,
+            audio_data=None,
+            mm_processor_kwargs=None,
+            **kwargs,
+        ):
+            server_id, server = await self._acquire_server(request_id)
+            try:
+                return await server.generate.remote(
+                    request_id=uuid.uuid4().hex,
+                    prompt_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                    image_data=image_data,
+                    video_data=video_data,
+                    audio_data=audio_data,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                    **kwargs,
+                )
+            finally:
+                self._release_server(server_id)
+
+    agent_loop_module.AsyncLLMServerManager = AsyncLLMServerManager
+    if hasattr(agent_loop_module, "__all__"):
+        agent_loop_module.__all__.append("AsyncLLMServerManager")
+
+
+_patch_async_llm_server_manager()
 
 
 async def launch_servers(self):

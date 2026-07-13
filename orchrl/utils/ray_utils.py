@@ -71,6 +71,8 @@ def init_ray_with_temp_dirs(config=None, n_gpus_per_node=None):
         "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
         "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
     }
+    if _transfer_queue_enabled(config):
+        runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
     runtime_env_vars["PYTHONPATH"] = _build_runtime_pythonpath()
     filtered_runtime_env_vars = {}
     for key, value in runtime_env_vars.items():
@@ -176,3 +178,19 @@ def _build_runtime_pythonpath() -> str:
         seen.add(normalized)
         deduped_entries.append(normalized)
     return ":".join(deduped_entries)
+
+
+def _transfer_queue_enabled(config=None) -> bool:
+    transfer_queue_cfg = getattr(config, "transfer_queue", None) if config is not None else None
+    if transfer_queue_cfg is not None and bool(getattr(transfer_queue_cfg, "enable", False)):
+        return True
+
+    training_cfg = getattr(config, "training", None) if config is not None else None
+    backend = getattr(training_cfg, "ppo_backend", None) if training_cfg is not None else None
+    return backend is not None and str(backend).lower() in {
+        "v1",
+        "v1_tq",
+        "ppo_v1",
+        "ppo_v1_tq",
+        "transfer_queue",
+    }

@@ -489,6 +489,22 @@ trainer:
   rejection_sample: False # Reject sample prompts that all succeed or all fail (0 signal for GRPO due to normalization).
   rejection_sample_multiplier: 2 # Multiple the training batch size by this factor to account for rejection sampling reduction.
   n_training_gpus_per_node: 4 # For verl-pipeline. 使用4个可见GPU
+  use_v1: true
+  v1:
+    trainer_mode: sync
+    sync: {}
+    colocate_async:
+      num_warmup_batches: 1
+    separate_async:
+      num_warmup_batches: 1
+      parameter_sync_step: 4
+    sampler:
+      max_off_policy_threshold: 8
+      max_off_policy_strategy: drop
+      custom_sampler:
+        path: null
+        name: null
+      sampler_kwargs: {}
 
 # profiler configs
 global_profiler:
@@ -577,3 +593,23 @@ ray_kwargs:
 
 resource:
   run_training_in_driver: false
+
+transfer_queue:
+  enable: false
+  metrics:
+    enabled: false
+    port: 0
+  backend:
+    storage_backend: SimpleStorage
+    SimpleStorage:
+      total_storage_size: 100000
+      num_data_storage_units: 8
+    MooncakeStore:
+      auto_init: false
+      metadata_server: localhost:50123
+      master_server_address: localhost:50124
+      local_hostname: localhost
+      protocol: tcp
+      global_segment_size: 4294967296
+      local_buffer_size: 1073741824
+      device_name: ""

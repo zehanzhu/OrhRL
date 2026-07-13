@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import transfer_queue as tq
 
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor
@@ -22,6 +23,7 @@ from orchrl.trainer.mate.dataproto_adapter import (
 )
 from orchrl.trainer.mate.mas_metrics import build_mas_metrics
 from orchrl.trainer.mate.trajectory_export import maybe_export_prompt_trajectories
+from orchrl.trainer.v1_tq_adapter import prepare_dataproto_for_v1_transfer_queue
 from orchrl.utils.performance import colorful_print, simple_timer
 
 @dataclass
@@ -377,36 +379,167 @@ class TrainingStepExecutor:
             timing_raw=timing_raw,
         )
 
+    def execute_v1_tq_training_step(self, step_idx: int):
+        batch_per_trainer: dict[str, DataProto] = {}
+        present_policy_names = []
+        missing_policy_names = []
+        metrics = {}
+        timing_raw = {}
+
+        with simple_timer("collect_trajectory", timing_raw):
+            gen_batch_output_per_policy = self.collect_mate_step_batches(step_idx=step_idx)
+            metrics.update(
+                self.build_rollout_failure_metrics(
+                    self._last_mate_rollout_accounting,
+                )
+            )
+            metrics.update(
+                self.build_mas_train_metrics(
+                    episodes=getattr(self, "_last_mate_episodes", []),
+                    expected_job_count=self._last_mate_rollout_accounting[
+                        "expected_job_count"
+                    ],
+                    failed_count=self._last_mate_rollout_accounting["failed_count"],
+                )
+            )
+            present_policy_names, missing_policy_names = self.resolve_mate_policy_batches(
+                gen_batch_output_per_policy
+            )
+            metrics.update(
+                self.build_mate_policy_presence_metrics(
+                    present_policy_names=present_policy_names,
+                    missing_policy_names=missing_policy_names,
+                )
+            )
+            if missing_policy_names:
+                colorful_print(
+                    (
+                        "Warning: MATE rollout missing policy batches for "
+                        f"{missing_policy_names}; skipping updates for these policies this step. "
+                        f"Available policies: {present_policy_names}"
+                    ),
+                    "yellow",
+                )
+
+            for model_name in present_policy_names:
+                batch_per_trainer[model_name] = gen_batch_output_per_policy[model_name]
+
+        update_timing_raw = {}
+        with simple_timer("update_parameters", update_timing_raw):
+            updated_policy_names = []
+            for model_name in present_policy_names:
+                trainer = self.policy_trainer_registry.ppo_trainer_dict[model_name]
+                batch = batch_per_trainer.get(model_name)
+                if not self.has_real_batch(batch):
+                    continue
+
+                batch = self.filter_untrained_agents(batch)
+                if not self.has_real_batch(batch) or len(batch) == 0:
+                    continue
+
+                filter_ratio = getattr(trainer.config, "filter_ratio", 0.0)
+                filter_method = getattr(trainer.config, "filter_method", "uid")
+                batch = self.filter_batch_by_existing_uid_groups(
+                    batch,
+                    filter_ratio=filter_ratio,
+                    mode=filter_method,
+                )
+                batch_per_trainer[model_name] = batch
+
+                trainer.global_steps = int(step_idx) + 1
+                local_metrics = {}
+                local_timing_raw = {}
+                batch_meta = None
+
+                try:
+                    if hasattr(trainer, "on_step_begin"):
+                        trainer.on_step_begin()
+
+                    sample_batch_size = prepare_dataproto_for_v1_transfer_queue(
+                        data_proto=batch,
+                        trainer=trainer,
+                        global_steps=trainer.global_steps,
+                    )
+                    if sample_batch_size <= 0:
+                        continue
+
+                    batch_meta = trainer._step_once(
+                        local_metrics,
+                        local_timing_raw,
+                        sample_batch_size,
+                    )
+
+                    if hasattr(trainer, "_compute_metrics"):
+                        trainer._compute_metrics(
+                            batch_meta,
+                            local_metrics,
+                            local_timing_raw,
+                            global_steps=trainer.global_steps,
+                            epoch=int(step_idx),
+                        )
+                    updated_policy_names.append(model_name)
+                finally:
+                    if batch_meta is not None:
+                        tq.kv_clear(keys=batch_meta.keys, partition_id=batch_meta.partition_id)
+                    if hasattr(trainer, "on_step_end"):
+                        trainer.on_step_end()
+
+                for key, value in local_timing_raw.items():
+                    update_timing_raw[key] = max(update_timing_raw.get(key, 0), value)
+                for key, value in local_metrics.items():
+                    metrics[f"{model_name}_{key}"] = value
+
+            present_policy_names = updated_policy_names
+
+        timing_raw.update(update_timing_raw)
+
+        return TrainingStepResult(
+            batch_per_trainer=batch_per_trainer,
+            present_policy_names=present_policy_names,
+            missing_policy_names=missing_policy_names,
+            metrics=metrics,
+            timing_raw=timing_raw,
+        )
+
+    def filter_untrained_agents(self, batch):
+        if not self.agent_untrained or len(self.agent_untrained) == 0:
+            return batch
+        if "agent_name" not in batch.non_tensor_batch:
+            return batch
+
+        agent_names = batch.non_tensor_batch["agent_name"]
+        keep_indices = [
+            i for i, name in enumerate(agent_names) if name not in self.agent_untrained
+        ]
+
+        if len(keep_indices) == len(agent_names):
+            return batch
+
+        colorful_print(
+            (
+                "Filtering training data: keeping "
+                f"{len(keep_indices)}/{len(agent_names)} samples "
+                f"(excluding agents: {self.agent_untrained})"
+            ),
+            "yellow",
+        )
+        if not keep_indices:
+            colorful_print(
+                "Warning: All samples filtered out, skipping parameter update",
+                "red",
+            )
+            return batch.select_idxs([])
+        return batch.select_idxs(keep_indices)
+
     def update_parameters(self, batch, ppo_trainer, timing_raw):
         if not hasattr(batch, "meta_info"):
             batch.meta_info = {}
         if "metrics" not in batch.meta_info:
             batch.meta_info["metrics"] = {}
 
-        if self.agent_untrained and len(self.agent_untrained) > 0:
-            if "agent_name" in batch.non_tensor_batch:
-                agent_names = batch.non_tensor_batch["agent_name"]
-                keep_indices = [
-                    i for i, name in enumerate(agent_names) if name not in self.agent_untrained
-                ]
-
-                if len(keep_indices) < len(agent_names):
-                    colorful_print(
-                        (
-                            "Filtering training data: keeping "
-                            f"{len(keep_indices)}/{len(agent_names)} samples "
-                            f"(excluding agents: {self.agent_untrained})"
-                        ),
-                        "yellow",
-                    )
-                    batch = batch.select_idxs(keep_indices)
-
-                    if len(keep_indices) == 0:
-                        colorful_print(
-                            "Warning: All samples filtered out, skipping parameter update",
-                            "red",
-                        )
-                        return batch
+        batch = self.filter_untrained_agents(batch)
+        if len(batch) == 0:
+            return batch
 
         prompts_batch = torch.nn.utils.rnn.pad_sequence(
             [torch.flip(i, dims=[0]) for i in batch.batch["prompts"]],
